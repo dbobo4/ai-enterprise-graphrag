@@ -1,0 +1,122 @@
+[
+  {
+    "id": "Q01",
+    "type": "local",
+    "question": "Ki vezeti a Project Atlas projektet?",
+    "expected_answer": "Nóra Varga",
+    "required_sources": [
+      "projects/atlas.md"
+    ]
+  },
+  {
+    "id": "Q02",
+    "type": "local",
+    "question": "Hány nap az ideiglenes külsős fiókok maximális kezdeti érvényessége?",
+    "expected_answer": "30 nap",
+    "required_sources": [
+      "policies/access.md"
+    ]
+  },
+  {
+    "id": "Q03",
+    "type": "local",
+    "question": "Melyik napon történt a Project Bridge onboarding incidense?",
+    "expected_answer": "2026-10-09",
+    "required_sources": [
+      "incidents/bridge.md"
+    ]
+  },
+  {
+    "id": "Q04",
+    "type": "local",
+    "question": "Milyen hardvert szállít a GreenWire?",
+    "expected_answer": "Hálózati switcheket",
+    "required_sources": [
+      "vendors/greenwire.md"
+    ]
+  },
+  {
+    "id": "Q05",
+    "type": "multi-hop",
+    "question": "Ki vezeti azt a projektet, amelyhez a ClearID szolgáltatást nyújt?",
+    "expected_answer": "Tamás Fekete",
+    "required_sources": [
+      "vendors/clearid.md",
+      "projects/bridge.md"
+    ]
+  },
+  {
+    "id": "Q06",
+    "type": "multi-hop",
+    "question": "Melyik részlegen dolgozik a Project Atlas vezetője?",
+    "expected_answer": "IT",
+    "required_sources": [
+      "projects/atlas.md",
+      "people/roles.md"
+    ]
+  },
+  {
+    "id": "Q07",
+    "type": "multi-hop",
+    "question": "Melyik beszállító kapcsolódik a szeptemberi API-kiesésben érintett projekthez?",
+    "expected_answer": "NovaCloud Ltd.",
+    "required_sources": [
+      "incidents/atlas.md",
+      "vendors/novacloud.md"
+    ]
+  },
+  {
+    "id": "Q08",
+    "type": "multi-hop",
+    "question": "Ki vezeti a GreenWire által támogatott projektet?",
+    "expected_answer": "Réka Kiss",
+    "required_sources": [
+      "vendors/greenwire.md",
+      "projects/beacon.md"
+    ]
+  },
+  {
+    "id": "Q09",
+    "type": "global",
+    "question": "Hány különböző projektnek van saját projektleírása?",
+    "expected_answer": "3: Atlas, Bridge, Beacon",
+    "required_sources": [
+      "projects/atlas.md",
+      "projects/bridge.md",
+      "projects/beacon.md"
+    ]
+  },
+  {
+    "id": "Q10",
+    "type": "global",
+    "question": "Sorold fel az összes projektvezetőt!",
+    "expected_answer": "Nóra Varga, Tamás Fekete, Réka Kiss",
+    "required_sources": [
+      "projects/atlas.md",
+      "projects/bridge.md",
+      "projects/beacon.md"
+    ]
+  },
+  {
+    "id": "Q11",
+    "type": "global",
+    "question": "Milyen különböző okok szerepelnek mindhárom incidensjelentésben?",
+    "expected_answer": "Hibás API gateway routing, ellenőrzési időtúllépések, hibás switch firmware",
+    "required_sources": [
+      "incidents/atlas.md",
+      "incidents/bridge.md",
+      "incidents/beacon.md"
+    ]
+  },
+  {
+    "id": "Q12",
+    "type": "global",
+    "question": "Melyik három beszállító milyen projektekhez kapcsolódik?",
+    "expected_answer": "NovaCloud–Atlas, ClearID–Bridge, GreenWire–Beacon",
+    "required_sources": [
+      "vendors/novacloud.md",
+      "vendors/clearid.md",
+      "vendors/greenwire.md"
+    ]
+  }
+]
