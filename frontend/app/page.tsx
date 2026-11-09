@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { readChatStream, type Source } from "./chat-stream";
+import { readChatStream, requestChat, type Source, type SearchSystem, type VectorMode } from "./chat-stream";
 
 type ChatResult = { answer: string; sources: Source[]; top_k: number };
 type CorpusStatus = { documents: number; indexed_chunks: number; ready: boolean; seed_ready: boolean };
@@ -10,6 +10,9 @@ type UploadResult = { filename: string; unchanged: boolean };
 export default function Home() {
   const [corpus, setCorpus] = useState<CorpusStatus | null>(null);
   const [available, setAvailable] = useState(true);
+  const [graph, setGraph] = useState<{ ready: boolean } | null>(null);
+  const [graphAvailable, setGraphAvailable] = useState(true);
+  const [system, setSystem] = useState<SearchSystem>("vector");
   const [question, setQuestion] = useState("");
   const [result, setResult] = useState<ChatResult | null>(null);
   const [message, setMessage] = useState("");
@@ -17,7 +20,7 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [uploadMessage, setUploadMessage] = useState("");
   const [uploadError, setUploadError] = useState(false);
-  const [mode, setMode] = useState("standard");
+  const [mode, setMode] = useState<VectorMode>("standard");
   const [streaming, setStreaming] = useState(false);
   const controller = useRef<AbortController | null>(null);
 
@@ -30,8 +33,18 @@ export default function Home() {
     } catch { setAvailable(false); }
   }
 
+  async function refreshGraph() {
+    try {
+      const response = await fetch("/api/graph");
+      if (!response.ok) throw new Error();
+      setGraph(await response.json());
+      setGraphAvailable(true);
+    } catch { setGraphAvailable(false); }
+  }
+
   useEffect(() => {
     void refresh();
+    void refreshGraph();
     return () => { controller.current?.abort(); };
   }, []);
 
@@ -60,10 +73,7 @@ export default function Home() {
     controller.current = current;
     setBusy(true); setStreaming(true); setMessage("Searching documents…"); setResult(null);
     try {
-      const response = await fetch("/api/chat/stream", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, top_k: 4, mode }), signal: current.signal,
-      });
+      const response = await requestChat(question, system, mode, current.signal);
       await readChatStream(response, event => {
         if (event.type === "sources") {
           setResult({ answer: "", sources: event.sources, top_k: event.top_k });
@@ -109,17 +119,24 @@ export default function Home() {
     <main className="container">
       <h1>Knowledge assistant</h1>
       <p className="muted">Search company documents and your uploads, and explore their sources.</p>
-      {!available && <p role="status">Knowledge base is unavailable.</p>}
+      {((system === "vector" && !available) || (system === "graph" && !graphAvailable)) && <p role="status">Knowledge base is unavailable.</p>}
       <div className="columns">
         <section className="panel">
           <h2>Chat</h2>
+          <label htmlFor="search-system" className="muted">Search system</label>
+          <select id="search-system" value={system} disabled={busy} onChange={event => setSystem(event.target.value as SearchSystem)}>
+            <option value="vector">Vector RAG</option><option value="graph">Graph RAG</option>
+          </select>
+          {system === "vector" && <>
           <label htmlFor="search-mode" className="muted">Search mode</label>
-          <select id="search-mode" value={mode} disabled={busy} onChange={event => setMode(event.target.value)}>
+          <select id="search-mode" value={mode} disabled={busy} onChange={event => setMode(event.target.value as VectorMode)}>
             <option value="standard">Standard</option><option value="multi-step">Multi-step</option>
           </select>
+          </>}
+          {system === "graph" && <p className="muted">Search relationships and facts in the built-in company documents.</p>}
           <label htmlFor="question" className="muted">Your question</label>
           <textarea id="question" value={question} onChange={event => setQuestion(event.target.value)} placeholder="Ki vezeti az Atlas projektet?" />
-          <button onClick={ask} disabled={busy || !corpus?.ready || question.trim().length < 3}>Ask</button>
+          <button onClick={ask} disabled={busy || !(system === "graph" ? graphAvailable && graph?.ready : available && corpus?.ready) || question.trim().length < 3}>Ask</button>
           {streaming && <button className="stop" onClick={() => controller.current?.abort()}>Stop</button>}
           {message && <p className="muted" role="status">{message}</p>}
           {result && <div className="answer"><h2>Answer</h2><p>{result.answer}</p><h2 className="section-title">Sources</h2>
@@ -129,10 +146,12 @@ export default function Home() {
         <section className="panel">
           <h2>Documents</h2>
           {corpus && <p className="muted">{corpus.documents} built-in documents available.</p>}
-          {corpus?.ready && <p className="muted">Ready to search.</p>}
-          {corpus && !corpus.seed_ready && <button onClick={indexCorpus} disabled={busy}>Prepare documents</button>}
+          {system === "vector" && corpus?.ready && <p className="muted">Ready to search.</p>}
+          {system === "graph" && <p className="muted">{graph?.ready ? "Graph search is ready." : "Graph search is not ready."}</p>}
+          {system === "vector" && corpus && !corpus.seed_ready && <button onClick={indexCorpus} disabled={busy}>Prepare documents</button>}
           <h2 className="section-title">Upload a document</h2>
           <p className="muted">TXT, MD, PDF, DOCX, HTML or XLSX · Up to 10 MB</p>
+          {system === "graph" && <p className="muted">Uploaded documents are available in Vector RAG.</p>}
           <label htmlFor="document" className="muted">Choose a document</label>
           <input id="document" type="file" accept=".txt,.md,.pdf,.docx,.html,.xlsx" disabled={busy}
             onChange={event => { setFile(event.target.files?.[0] ?? null); setUploadMessage(""); }} />

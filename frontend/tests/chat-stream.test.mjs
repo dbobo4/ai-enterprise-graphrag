@@ -1,10 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readChatStream } from "../app/chat-stream.ts";
+import { readChatStream, requestChat } from "../app/chat-stream.ts";
 
 const source = { source: "projects/bridge.md", chunk: 0, reference: "projects/bridge.md#0", snippet: "Tamás Fekete" };
 const sources = { type: "sources", sources: [source], top_k: 4 };
 const done = { type: "done" };
+
+test("search selection sends the correct backend mode and keeps streaming sources", async t => {
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (path, options) => {
+    calls.push({ path, options });
+    return response([frames([sources, { type: "token", text: "Answer" }, done])]);
+  });
+  for (const [system, mode, expected] of [["vector", "standard", "standard"], ["vector", "multi-step", "multi-step"], ["graph", "multi-step", "graph"]]) {
+    const signal = new AbortController().signal;
+    const received = [];
+    await readChatStream(await requestChat("Who leads Bridge?", system, mode, signal), event => received.push(event), signal);
+    const { path, options } = calls.at(-1);
+    assert.equal(path, "/api/chat/stream");
+    assert.equal(options.signal, signal);
+    assert.deepEqual(JSON.parse(options.body), { question: "Who leads Bridge?", top_k: 4, mode: expected });
+    assert.deepEqual(received[0], sources);
+    assert.deepEqual(received.at(-1), done);
+  }
+});
 
 function frames(events, newline = "\n") {
   let text = "";

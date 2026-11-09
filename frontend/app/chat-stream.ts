@@ -1,9 +1,18 @@
 export type Source = { source: string; chunk: number; reference: string; snippet: string };
+export type SearchSystem = "vector" | "graph";
+export type VectorMode = "standard" | "multi-step";
 export type ChatEvent =
   | { type: "sources"; sources: Source[]; top_k: number }
   | { type: "token"; text: string }
   | { type: "done" }
   | { type: "error"; message: string };
+
+export function requestChat(question: string, system: SearchSystem, mode: VectorMode, signal: AbortSignal) {
+  return fetch("/api/chat/stream", {
+    method: "POST", headers: { "Content-Type": "application/json" }, signal,
+    body: JSON.stringify({ question, top_k: 4, mode: system === "graph" ? "graph" : mode }),
+  });
+}
 
 export async function readChatStream(response: Response, onEvent: (event: ChatEvent) => void, signal: AbortSignal) {
   signal.throwIfAborted();

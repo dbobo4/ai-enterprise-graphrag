@@ -6,6 +6,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.rag import answer_chain, chat_model, client, make_retriever, require_key, source_context
+from app.graph import retrieve_graph_async
 
 MAX_STEPS = 3
 MISSING_EVIDENCE = "Nincs elegendő információ a korpuszban."
@@ -103,8 +104,26 @@ async def multi_step_documents(question: str, retriever) -> tuple[list[Document]
     return documents, True
 
 
+async def stream_response(question: str, k: int, context: str, sources: list[dict], missing: str | None):
+    yield {"type": "sources", "sources": sources, "top_k": k}
+    if missing:
+        yield {"type": "token", "text": missing}
+    else:
+        async with aclosing(answer_chain().astream({"context": context, "question": question})) as tokens:
+            async for token in tokens:
+                if token:
+                    yield {"type": "token", "text": token}
+    yield {"type": "done"}
+
+
 async def stream_answer(question: str, k: int, mode: str):
     require_key()
+    if mode == "graph":
+        context, sources, missing = await retrieve_graph_async(question)
+        async with aclosing(stream_response(question, k, context, sources, missing)) as events:
+            async for event in events:
+                yield event
+        return
     with closing(client()) as db:
         retriever = await asyncio.to_thread(make_retriever, db, k)
         if mode == "multi-step":
@@ -113,12 +132,6 @@ async def stream_answer(question: str, k: int, mode: str):
             documents = await retriever.ainvoke(question)
             complete = bool(documents)
         context, sources = source_context(documents)
-        yield {"type": "sources", "sources": sources, "top_k": k}
-        if not complete:
-            yield {"type": "token", "text": MISSING_EVIDENCE}
-        else:
-            async with aclosing(answer_chain().astream({"context": context, "question": question})) as tokens:
-                async for token in tokens:
-                    if token:
-                        yield {"type": "token", "text": token}
-        yield {"type": "done"}
+        async with aclosing(stream_response(question, k, context, sources, None if complete else MISSING_EVIDENCE)) as events:
+            async for event in events:
+                yield event

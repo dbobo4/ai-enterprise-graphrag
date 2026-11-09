@@ -36,4 +36,5 @@ button:not(:disabled) { cursor: pointer; }
 .answer-comparison ul { padding-left: 18px; }
 .evaluation-answer { white-space: pre-wrap; line-height: 1.6; }
 .evaluation-error { color: #a12626; }
+.evaluation-actions { display: flex; gap: 12px; flex-wrap: wrap; }
 @media (max-width: 720px) { .answer-comparison { grid-template-columns: 1fr; gap: 0; } }

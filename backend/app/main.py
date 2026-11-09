@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.chat import stream_answer
 from app.evaluation import run_evaluation
+from app.graph import graph_answer, graph_status
 from app.rag import answer, corpus_status, index_seed
 from app.uploads import MAX_UPLOAD_BYTES, UploadError, upload_document
 
@@ -22,7 +23,11 @@ class ChatRequest(BaseModel):
 
 
 class StreamChatRequest(ChatRequest):
-    mode: Literal["standard", "multi-step"] = "standard"
+    mode: Literal["standard", "multi-step", "graph"] = "standard"
+
+
+class EvaluationRequest(BaseModel):
+    system: Literal["vector", "graph"] = "vector"
 
 
 @app.get("/api/health")
@@ -38,6 +43,14 @@ def corpus() -> dict:
         raise HTTPException(status_code=503, detail="Qdrant is unavailable.") from exc
 
 
+@app.get("/api/graph")
+def graph() -> dict:
+    try:
+        return graph_status()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Graph search is unavailable.") from exc
+
+
 @app.get("/api/questions")
 def questions() -> list[dict]:
     path = Path("/app/evaluation/questions.json")
@@ -45,11 +58,13 @@ def questions() -> list[dict]:
 
 
 @app.post("/api/evaluate")
-def evaluate() -> dict:
+def evaluate(request: EvaluationRequest | None = None) -> dict:
     try:
         test_questions = questions()
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="Test questions are unavailable.") from exc
+    if request and request.system == "graph":
+        return run_evaluation(test_questions, graph_answer)
     return run_evaluation(test_questions, partial(answer, seed_only=True))
 
 

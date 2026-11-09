@@ -11,6 +11,10 @@ services:
     env_file: .env
     environment:
       QDRANT_URL: http://qdrant:6333
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-enterprise-demo-password}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -19,6 +23,23 @@ services:
       - ./evaluation/questions.json:/app/evaluation/questions.json:ro
     depends_on:
       - qdrant
+
+  neo4j:
+    image: neo4j:5.26.0
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-enterprise-demo-password}
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$${NEO4J_AUTH#*/}\" 'RETURN 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   frontend:
     build: ./frontend
@@ -29,3 +50,4 @@ services:
 
 volumes:
   qdrant_data:
+  neo4j_data:
