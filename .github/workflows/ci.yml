@@ -45,4 +45,6 @@ jobs:
         working-directory: frontend
         run: npm run build
       - name: Docker Compose configuration
-        run: docker compose --env-file .env.example config --no-env-resolution --quiet
+        run: |
+          cp .env.example .env
+          docker compose --env-file .env.example config --quiet
