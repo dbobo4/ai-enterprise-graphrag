@@ -33,9 +33,9 @@ class SeedTests(unittest.TestCase):
                 entities[node["id"]] = node
                 text = (rag.SEED_DIR / node["source_id"]).read_text(encoding="utf-8").casefold()
                 for key, value in node.items():
-                    if key not in ("id", "label", "source_id", "dataset"):
+                    if key not in ("id", "label", "source_id", "dataset", "chunk_ids"):
                         self.assertIn(str(value).casefold(), text, (node["id"], key))
-        self.assertEqual(len(entities), 19)
+        self.assertEqual(len(entities), len(graph_seed.NODES))
         self.assertEqual(len(nodes), len(set(node["id"] for node in nodes)))
         self.assertEqual(len(edges), len(set(edge["id"] for edge in edges)))
         adjacency = {}
@@ -68,7 +68,7 @@ class SeedTests(unittest.TestCase):
                 chunks[node["id"]] = node
             elif node["label"] == "Document":
                 documents.append(node)
-        self.assertEqual(len(documents), 14)
+        self.assertEqual(len(documents), len(list(rag.SEED_DIR.rglob("*.md"))))
         self.assertEqual(set(chunks), set(ids))
         for document, chunk_id in zip(original, ids):
             node = chunks[chunk_id]
@@ -211,11 +211,11 @@ class GraphRetrievalTests(unittest.TestCase):
         self.vectors.assert_not_called()
 
     def test_two_hop_evidence_matches_the_baseline_source_identifiers(self):
-        row = {"vendor": "ClearID Kft.", "project": "Project Bridge", "leader": "Tamás Fekete", "source_ids": ["vendors/clearid.md", "projects/bridge.md"]}
+        row = {"vendor": "ClearID Kft.", "project": "Project Bridge", "leader": "Tamás Fekete", "source_ids": ["vendors/clearid.md", "projects/bridge.md"], "chunk_ids": ["vendor", "project"]}
         self.read.side_effect = [[row], self.chunks]
         context, sources, missing = graph.graph_context(graph.CypherPlan(operation="vendor_leader", entity_id="vendor:clearid"))
         self.assertIsNone(missing)
-        self.assertEqual({source["source"] for source in sources}, set(QUESTIONS[4]["required_sources"]))
+        self.assertEqual({source["source"] for source in sources}, {"vendors/clearid.md", "projects/bridge.md"})
         self.assertEqual(sources[0]["reference"], "vendors/clearid.md#0")
         self.assertIn("Tamás Fekete", context)
         self.assertIn("untrusted source data", context)
@@ -227,8 +227,8 @@ class GraphRetrievalTests(unittest.TestCase):
         context, sources, missing = graph.graph_context(graph.CypherPlan(operation="unsupported", entity_id=None))
         self.assertEqual((context, sources, missing), ("", [], graph.UNSUPPORTED))
         self.driver.assert_not_called()
-        cases = [([], []), ([{"project_count": 0, "source_ids": []}], []),
-                 ([{"project_count": 1, "source_ids": ["projects/atlas.md"]}], self.chunks)]
+        cases = [([], []), ([{"project": "Atlas", "source_ids": [], "chunk_ids": []}], []),
+                 ([{"project": "Atlas", "source_ids": ["projects/atlas.md"], "chunk_ids": ["absent"]}], self.chunks)]
         for rows, chunks in cases:
             self.read.side_effect = [rows, chunks]
             with self.subTest(rows=rows):
@@ -239,11 +239,59 @@ class GraphRetrievalTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             graph.graph_context(graph.CypherPlan(operation="projects", entity_id=None))
 
+    def test_only_declared_evidence_chunks_enter_context_and_work_is_counted(self):
+        row = {"leader": "Tamás Fekete", "source_ids": ["vendors/clearid.md", "projects/bridge.md"], "chunk_ids": ["vendor", "project"]}
+        unrelated = {"id": "other", "source": "vendors/clearid.md", "chunk": 4, "text": "Unrelated invoice discussion."}
+        self.read.side_effect = [[row], self.chunks + [unrelated]]
+        calls = {"llm": 1, "vector_searches": 0, "graph_queries": 0}
+        context, sources, missing = graph.graph_context(graph.CypherPlan(operation="vendor_leader", entity_id="vendor:clearid"), calls=calls)
+        self.assertIsNone(missing)
+        self.assertEqual(len(sources), 2)
+        self.assertNotIn("Unrelated invoice", context)
+        self.assertEqual(self.read.call_args.args[2]["chunk_ids"], ["project", "vendor"])
+        self.assertEqual(calls["graph_queries"], 2)
+
+    def test_missing_or_excessive_provenance_cannot_generate_a_claim(self):
+        ids = []
+        for index in range(graph.MAX_CHUNKS + 1):
+            ids.append(str(index))
+        self.read.return_value = [{"project": "Atlas", "source_ids": ["projects/atlas.md"], "chunk_ids": ids}]
+        self.assertEqual(graph.graph_context(graph.CypherPlan(operation="projects", entity_id=None)), ("", [], graph.MISSING_EVIDENCE))
+        self.assertEqual(self.read.call_count, 1)
+
+    def test_graph_answer_reports_unsupported_work_without_answer_generation(self):
+        with patch.object(graph, "cypher_chain", return_value=Mock(invoke=Mock(return_value={"operation": "unsupported", "entity_id": None}))), patch.object(graph, "answer_chain") as answer:
+            result = graph.graph_answer("What did the rehearsal meeting approve?", 4)
+        self.assertEqual(result["status"], "unsupported")
+        self.assertEqual(result["sources"], [])
+        self.assertEqual(result["calls"], {"llm": 1, "vector_searches": 0, "graph_queries": 0})
+        answer.assert_not_called()
+        self.driver.assert_not_called()
+
+    def test_readiness_detects_obsolete_chunk_ids_even_when_counts_match(self):
+        with patch.object(rag, "SEED_DIR", ROOT / "data/seed"):
+            nodes, edges = graph_seed.seed_graph()
+            ids = [node["id"] for node in nodes]
+            links = [edge["id"] for edge in edges]
+            row = {"ids": ids, "entities": len(graph_seed.NODES), "documents": 34, "chunks": 170}
+            session = Mock()
+            with patch.object(graph, "graph_session", return_value=MagicMock()) as sessions:
+                sessions.return_value.__enter__.return_value = session
+                session.run.side_effect = [Mock(single=Mock(return_value=row)), Mock(single=Mock(return_value={"ids": links}))]
+                self.assertTrue(graph.graph_status()["ready"])
+                stale = dict(row, ids=ids[:-1] + ["obsolete-id"])
+                session.run.side_effect = [Mock(single=Mock(return_value=stale)), Mock(single=Mock(return_value={"ids": links}))]
+                self.assertFalse(graph.graph_status()["ready"])
+
 
 class GraphApiTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(main.app)
         self.addCleanup(self.client.close)
+        for name, result in (("corpus_status", {"seed_ready": True}), ("graph_status", {"ready": True})):
+            readiness = patch.object(main, name, return_value=result)
+            readiness.start()
+            self.addCleanup(readiness.stop)
 
     def test_evaluations_use_same_questions_categories_and_separate_retrieval(self):
         vector_result = {"answer": "Vector answer", "sources": [SOURCE]}

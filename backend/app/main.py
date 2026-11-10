@@ -1,5 +1,6 @@
 import json
 from contextlib import aclosing
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Literal
@@ -8,10 +9,10 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.chat import stream_answer
+from app.chat import answer_multi_step, stream_answer
 from app.evaluation import run_evaluation
 from app.graph import graph_answer, graph_status
-from app.rag import answer, corpus_status, index_seed
+from app.rag import answer, corpus_status, index_seed, seed_manifest
 from app.uploads import MAX_UPLOAD_BYTES, UploadError, upload_document
 
 app = FastAPI(title="Enterprise GraphRAG API", version="0.2.0")
@@ -27,7 +28,7 @@ class StreamChatRequest(ChatRequest):
 
 
 class EvaluationRequest(BaseModel):
-    system: Literal["vector", "graph"] = "vector"
+    system: Literal["vector", "standard", "multi-step", "graph"] = "standard"
 
 
 @app.get("/api/health")
@@ -63,9 +64,29 @@ def evaluate(request: EvaluationRequest | None = None) -> dict:
         test_questions = questions()
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="Test questions are unavailable.") from exc
-    if request and request.system == "graph":
-        return run_evaluation(test_questions, graph_answer)
-    return run_evaluation(test_questions, partial(answer, seed_only=True))
+    system = request.system if request else "standard"
+    manifest = seed_manifest()
+    if system == "vector":
+        system = "standard"
+    if system == "graph":
+        try:
+            ready = graph_status()["ready"]
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Graph search is unavailable.") from exc
+        respond = graph_answer
+    else:
+        try:
+            ready = corpus_status()["seed_ready"]
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Vector search is unavailable.") from exc
+        respond = answer_multi_step if system == "multi-step" else partial(answer, seed_only=True)
+    if not ready:
+        raise HTTPException(status_code=409, detail="Synchronize the built-in knowledge before evaluation.")
+    result = run_evaluation(test_questions, respond, system=system)
+    if seed_manifest() != manifest:
+        raise HTTPException(status_code=409, detail="Built-in documents changed during evaluation. Run it again after synchronization.")
+    result.update({"system": system, "corpus": manifest, "completed_at": datetime.now(timezone.utc).isoformat()})
+    return result
 
 
 @app.post("/api/ingest/upload")

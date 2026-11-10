@@ -193,7 +193,7 @@ class UploadTests(unittest.TestCase):
     def test_all_twelve_baseline_results_and_seed_points_survive_upload(self):
         self.stack.enter_context(patch.object(rag, "SEED_DIR", PROJECT / "data" / "seed"))
         rag.index_seed()
-        before_points, _ = self.db.scroll(rag.COLLECTION, limit=100)
+        before_points, _ = self.db.scroll(rag.COLLECTION, limit=1000)
         before = {}
         for point in before_points:
             before[str(point.id)] = point.payload

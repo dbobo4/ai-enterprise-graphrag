@@ -1,6 +1,7 @@
 import asyncio
 import json
 import unittest
+import unicodedata
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, call, patch
@@ -79,6 +80,46 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(VENDOR.page_content, inputs["context"])
         self.assertIn(PROJECT.page_content, inputs["context"])
 
+    async def test_failed_extraction_retries_once_then_uses_only_verified_value(self):
+        fabricated = {**PROJECT_FACT, "value": "Project Atlas"}
+        self.use_plan(facts=[fabricated, PROJECT_FACT, LEADER_FACT])
+        self.retriever.ainvoke.side_effect = [[VENDOR], [PROJECT]]
+        events = await self.collect("multi-step")
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(self.retriever.ainvoke.await_args_list, [call("Which project uses ClearID?"), call("Who leads Project Bridge?")])
+        self.answer_chain.assert_called_once()
+
+    async def test_two_failed_extractions_stop_without_another_search_or_answer(self):
+        invalid = {**PROJECT_FACT, "value": "Project Atlas"}
+        self.use_plan(facts=[invalid, invalid])
+        calls = {"llm": 0, "vector_searches": 0, "graph_queries": 0}
+        documents, complete = await chat.multi_step_documents("ClearID leader?", self.retriever, calls=calls)
+        self.assertFalse(complete)
+        self.assertEqual(documents, [VENDOR])
+        self.assertEqual(calls, {"llm": 3, "vector_searches": 1, "graph_queries": 0})
+        self.retriever.ainvoke.assert_awaited_once()
+        self.answer_chain.assert_not_called()
+
+    async def test_invalid_structured_extraction_can_recover_on_its_single_retry(self):
+        self.use_plan(facts=[{"value": "Bridge"}, PROJECT_FACT, LEADER_FACT])
+        self.retriever.ainvoke.side_effect = [[VENDOR], [PROJECT]]
+        events = await self.collect("multi-step")
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(self.retriever.ainvoke.await_count, 2)
+
+    async def test_absent_structured_extraction_retries_once_and_preserves_unverified_sources(self):
+        for facts, complete in (([None, PROJECT_FACT, LEADER_FACT], True), ([None, None], False)):
+            with self.subTest(complete=complete):
+                self.use_plan(facts=facts)
+                self.retriever.ainvoke.side_effect = [[VENDOR], [PROJECT]]
+                calls = {"llm": 0, "vector_searches": 0, "graph_queries": 0}
+                documents, actual = await chat.multi_step_documents("Who leads the ClearID project?", self.retriever, calls=calls)
+                self.assertEqual(actual, complete)
+                self.assertEqual(documents, [VENDOR, PROJECT] if complete else [VENDOR])
+                self.assertEqual(calls["llm"], 4 if complete else 3)
+                self.assertEqual(calls["vector_searches"], 2 if complete else 1)
+        self.answer_chain.assert_not_called()
+
     async def test_maximum_steps_are_bounded_and_duplicate_chunks_are_not_repeated(self):
         steps = []
         facts = []
@@ -115,7 +156,7 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         for fact in invalid:
             with self.subTest(fact=fact):
                 self.retriever.ainvoke.reset_mock()
-                self.use_plan(facts=[fact])
+                self.use_plan(facts=[fact, fact])
                 events = await self.collect("multi-step")
                 self.retriever.ainvoke.assert_awaited_once_with("Which project uses ClearID?")
                 self.assertEqual(events[1], {"type": "token", "text": chat.MISSING_EVIDENCE})
@@ -123,7 +164,8 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.answer_chain.assert_not_called()
 
     async def test_missing_final_evidence_preserves_sources_without_generating_a_claim(self):
-        self.use_plan(facts=[PROJECT_FACT, {"value": None, "reference": None, "quote": None}])
+        missing = {"value": None, "reference": None, "quote": None}
+        self.use_plan(facts=[PROJECT_FACT, missing, missing])
         self.retriever.ainvoke.side_effect = [[VENDOR], [PROJECT]]
         events = await self.collect("multi-step")
         self.assertEqual(len(events[0]["sources"]), 2)
@@ -233,7 +275,7 @@ class StreamApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_streaming_chat_and_evaluation_remain_standard_and_seed_scoped(self):
         answer = {"answer": "Answer", "sources": [], "top_k": 4}
         questions_path = Path(__file__).resolve().parents[2] / "evaluation" / "questions.json"
-        with TestClient(main.app) as client, patch.object(main, "answer", return_value=answer) as respond, patch.object(main, "stream_answer") as stream, patch.object(main, "Path", return_value=questions_path):
+        with TestClient(main.app) as client, patch.object(main, "answer", return_value=answer) as respond, patch.object(main, "stream_answer") as stream, patch.object(main, "Path", return_value=questions_path), patch.object(main, "corpus_status", return_value={"seed_ready": True}):
             response = client.post("/api/chat", json={"question": "ClearID project?", "mode": "multi-step"})
             self.assertEqual(response.json(), answer)
             respond.assert_called_once_with("ClearID project?", 4)
@@ -286,6 +328,49 @@ class StreamRetrievalTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("uploads/notes.txt", [source["source"] for source in first["sources"]])
             baseline = rag.answer("ClearID project?", 4, seed_only=True)
             self.assertEqual([source["source"] for source in baseline["sources"]], ["projects/bridge.md"])
+            result = await chat.multi_step_answer("ClearID project?", 4, seed_only=True)
+            self.assertEqual([source["source"] for source in result["sources"]], ["projects/bridge.md"])
+            self.assertEqual(result["status"], "insufficient")
+            self.assertEqual(result["calls"], {"llm": 3, "vector_searches": 1, "graph_queries": 0})
+
+
+class EvidenceTests(unittest.TestCase):
+    def check(self, value, quote, text, reference="fixture.md#0"):
+        fact = chat.GroundedFact(value=value, quote=quote, reference=reference)
+        document = Document(page_content=text, metadata={"source": "fixture.md", "chunk": 0})
+        return chat.supported_value(fact, [document])
+
+    def test_case_canonical_unicode_whitespace_and_simple_formatting_are_harmless(self):
+        name = unicodedata.normalize("NFD", "Nóra Varga")
+        self.assertEqual(self.check(name, "NÓRA\u00a0VARGA leads Project Atlas.", "**Nóra Varga** leads Project Atlas."), name)
+        for quote, text in [
+            ("Nóra Varga leads Project Atlas.", "<strong>Nóra Varga</strong> leads `Project Atlas`."),
+            ("Nóra Varga leads Project Atlas.", "__Nóra Varga__ leads _Project Atlas_."),
+            ("The launch is 2026-11-15.", "The launch is 2026\u201111\u201115."),
+        ]:
+            value = "2026-11-15" if "launch" in quote else "Nóra Varga"
+            with self.subTest(text=text):
+                self.assertEqual(self.check(value, quote, text), value)
+
+    def test_distinct_people_accents_tokens_and_numeric_values_never_match_loosely(self):
+        cases = [
+            ("Nóra Varga", "Nóra Váradi leads Project Atlas.", "Nóra Váradi leads Project Atlas."),
+            ("Nora Varga", "Nóra Varga leads Project Atlas.", "Nóra Varga leads Project Atlas."),
+            ("Nóra Varga", "Nóra Vargai leads Project Atlas.", "Nóra Vargai leads Project Atlas."),
+            ("Nóra Varga", "Nóra Varga-Szabó leads Project Atlas.", "Nóra Varga-Szabó leads Project Atlas."),
+            ("30", "The validity is 130 days.", "The validity is 130 days."),
+            ("30", "The value is 30.5.", "The value is 30.5."),
+            ("30", "The value is -30.", "The value is -30."),
+            ("2026", "The launch is 2026-11-15.", "The launch is 2026-11-15."),
+            ("30", "The value is 30%.", "The value is 30%."),
+            ("x2", "The formula is x².", "The formula is x²."),
+            ("Nóra Varga", "Nóra Varga leads Project Atlas.", "Nóra Varga advises Project Atlas."),
+        ]
+        for value, quote, text in cases:
+            with self.subTest(value=value, quote=quote):
+                self.assertIsNone(self.check(value, quote, text))
+        self.assertIsNone(self.check("Nóra Varga", "Nóra Varga leads.", "Nóra Varga leads.", reference="other.md#0"))
+        self.assertIsNone(self.check("{previous_answer}", "{previous_answer}", "{previous_answer}"))
 
 
 if __name__ == "__main__":

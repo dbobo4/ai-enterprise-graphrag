@@ -55,6 +55,25 @@ def seed_chunks() -> tuple[list[Document], list[str]]:
     return documents, ids
 
 
+def seed_manifest() -> dict:
+    documents, ids = seed_chunks()
+    return {"documents": len(list(SEED_DIR.rglob("*.md"))), "chunks": len(documents), "top_k": 4,
+            "fingerprint": sha256("\n".join(ids).encode("utf-8")).hexdigest()}
+
+
+def indexed_seed_ids(db: QdrantClient) -> set[str]:
+    ids = set()
+    cursor = None
+    scope = models.Filter(must=[models.FieldCondition(key="metadata.kind", match=models.MatchValue(value="seed"))])
+    while True:
+        points, cursor = db.scroll(collection_name=COLLECTION, scroll_filter=scope, with_payload=False,
+                                   with_vectors=False, limit=100, offset=cursor)
+        for point in points:
+            ids.add(str(point.id))
+        if cursor is None:
+            return ids
+
+
 def index_seed() -> dict[str, int | bool]:
     require_key()
     documents, ids = seed_chunks()
@@ -65,18 +84,7 @@ def index_seed() -> dict[str, int | bool]:
         if not db.collection_exists(COLLECTION):
             db.create_collection(COLLECTION, vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE))
 
-        previous: set[str] = set()
-        cursor = None
-        while True:
-            points, cursor = db.scroll(
-                collection_name=COLLECTION,
-                scroll_filter=models.Filter(must=[models.FieldCondition(key="metadata.kind", match=models.MatchValue(value="seed"))]),
-                with_payload=False, with_vectors=False, limit=100, offset=cursor,
-            )
-            for point in points:
-                previous.add(str(point.id))
-            if cursor is None:
-                break
+        previous = indexed_seed_ids(db)
 
         vectorstore = store(db)
         missing = []
@@ -97,14 +105,15 @@ def index_seed() -> dict[str, int | bool]:
 
 
 def corpus_status() -> dict[str, int | bool]:
+    documents, ids = seed_chunks()
     with closing(client()) as db:
         indexed = 0
-        seed_indexed = 0
+        seed_ids = set()
         if db.collection_exists(COLLECTION):
             indexed = db.count(collection_name=COLLECTION, exact=True).count
-            scope = models.Filter(must=[models.FieldCondition(key="metadata.kind", match=models.MatchValue(value="seed"))])
-            seed_indexed = db.count(collection_name=COLLECTION, count_filter=scope, exact=True).count
-    return {"documents": len(list(SEED_DIR.rglob("*.md"))), "indexed_chunks": indexed, "ready": indexed > 0, "seed_ready": seed_indexed > 0}
+            seed_ids = indexed_seed_ids(db)
+    return {"documents": len(list(SEED_DIR.rglob("*.md"))), "chunks": len(documents), "indexed_chunks": indexed,
+            "ready": indexed > 0, "seed_ready": bool(ids) and seed_ids == set(ids)}
 
 
 def make_retriever(db: QdrantClient, k: int, seed_only: bool = False):
@@ -150,8 +159,10 @@ def answer(question: str, k: int, *, seed_only: bool = False) -> dict:
     require_key()
     with closing(client()) as db:
         documents = make_retriever(db, k, seed_only).invoke(question)
+        calls = {"llm": 0, "vector_searches": 1, "graph_queries": 0}
         if not documents:
-            return {"answer": "Nincs elegendő információ a korpuszban.", "sources": [], "top_k": k}
+            return {"answer": "Nincs elegendő információ a korpuszban.", "sources": [], "top_k": k, "status": "missing", "calls": calls}
         context, sources = source_context(documents)
+        calls["llm"] += 1
         result = answer_chain().invoke({"context": context, "question": question})
-        return {"answer": result, "sources": sources, "top_k": k}
+        return {"answer": result, "sources": sources, "top_k": k, "status": "complete", "calls": calls}

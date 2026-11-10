@@ -16,8 +16,25 @@ ANSWER = {"answer": "Generated answer", "sources": [SOURCE], "top_k": 4}
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_failure_logs_keep_exception_causes_locations_and_safe_reason_without_secrets(self):
+        def failing_answer(*args):
+            try:
+                raise RuntimeError("Event loop is closed")
+            except RuntimeError as cause:
+                raise ConnectionError("sk-private-key private prompt") from cause
+        with self.assertLogs("app.evaluation", level="ERROR") as logs:
+            result = run_evaluation(QUESTIONS[1:2], failing_answer, system="multi-step")
+        logged = " ".join(logs.output)
+        for detail in ("multi-step Q02", "ConnectionError", "RuntimeError", "event_loop_closed", "test_evaluation.py", "failing_answer"):
+            self.assertIn(detail, logged)
+        self.assertNotIn("sk-private-key", logged + str(result))
+        self.assertNotIn("private prompt", logged + str(result))
+        self.assertIsNotNone(result["results"][0]["error"])
+        self.assertIsNone(result["results"][0]["answer"])
+
     def test_coverage_counts_unique_expected_documents(self):
         question = dict(QUESTIONS[5])
+        question["required_sources"] = ["projects/atlas.md", "people/roles.md"]
         response = {"answer": "Generated answer", "sources": [SOURCE, SOURCE, {"source": "unrelated.md"}]}
         result = run_evaluation([question], Mock(return_value=response))["results"][0]
         self.assertEqual(result["source_coverage"], 0.5)
@@ -31,7 +48,10 @@ class EvaluationTests(unittest.TestCase):
                 self.assertEqual(result["results"][0]["source_coverage"], 0.0)
 
     def test_summary_and_categories_use_successful_questions(self):
-        questions = [QUESTIONS[0], QUESTIONS[1], QUESTIONS[5], QUESTIONS[8]]
+        questions = [dict(QUESTIONS[0]), dict(QUESTIONS[1]), dict(QUESTIONS[5]), dict(QUESTIONS[8])]
+        questions[0]["required_sources"] = ["projects/atlas.md"]
+        questions[1]["required_sources"] = ["policies/access.md"]
+        questions[2]["required_sources"] = ["projects/atlas.md", "people/roles.md"]
         complete = {"answer": "Generated answer", "sources": [SOURCE, {"source": "people/roles.md"}]}
         answer = Mock(side_effect=[ANSWER, ANSWER, complete, RuntimeError("Unavailable")])
         with patch("app.evaluation.perf_counter", side_effect=[0, 1, 10, 13, 20, 25, 30, 37]):
@@ -93,6 +113,12 @@ class EvaluationApiTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(self.api.app)
         self.addCleanup(self.client.close)
+        readiness = patch.object(self.api, "corpus_status", return_value={"seed_ready": True})
+        readiness.start()
+        self.addCleanup(readiness.stop)
+        manifest = patch.object(self.api, "seed_manifest", return_value={"documents": 34, "chunks": 158, "top_k": 4, "fingerprint": "offline"})
+        manifest.start()
+        self.addCleanup(manifest.stop)
 
     def test_post_returns_all_twelve_results_and_metrics(self):
         with patch.object(self.api, "Path", return_value=QUESTIONS_PATH), patch.object(self.api, "answer", return_value=ANSWER) as answer:

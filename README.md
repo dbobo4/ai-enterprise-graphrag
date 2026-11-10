@@ -28,6 +28,8 @@ The goal is a simple, understandable, production-oriented architecture, develope
 
 For Vector RAG, index the built-in corpus in Chat if it has not been indexed yet. Graph loading does not call OpenAI or change Qdrant.
 
+After changing seed documents, use **Prepare documents** in Chat and rerun the graph sync command. Seed synchronization removes obsolete seed records and preserves uploaded documents.
+
 Neo4j settings are listed in [.env.example](.env.example). `NEO4J_PASSWORD` initializes the password on first start; an existing volume keeps its original password. `NEO4J_DATABASE` defaults to `neo4j`. Compose sets the backend connection to `bolt://neo4j:7687` with username `neo4j`; outside Docker, use `NEO4J_URI` and `NEO4J_USERNAME` for the local connection. Neo4j data persists in the `neo4j_data` volume.
 
 ## Part 1  Naive RAG
@@ -35,40 +37,37 @@ Neo4j settings are listed in [.env.example](.env.example). `NEO4J_PASSWORD` init
 - Next.js frontend, FastAPI backend
 - Multi-stage Docker, Docker Compose
 - LangChain + OpenAI + Qdrant
-- Synthetic enterprise corpus (14 documents)
-- Standard and Multi-step RAG
+- Synthetic HelioWorks corpus: 34 business documents split into 170 chunks, similar project names and multiple suppliers
+- Vector Standard (top_k=4) and Multi-step RAG with verified intermediate evidence and one extraction retry
 - Document upload: TXT, MD, PDF, DOCX, HTML, XLSX
 - Streaming chat with source references
-- Automated evaluation (12 questions)
+- Seed-only evaluation on 12 local, multi-hop and global questions
 - Backend and frontend regression tests
 
 ### Results and observations
 
-- 12/12 evaluation questions completed.
-- Average source coverage: 88.9%.
-- Local and multi-hop: 100%; global: 66.7%.
-- Global questions exposed limitations in retrieving all relevant documents.
+- Both vector modes processed 12/12 questions; source coverage was 62.5% for Standard and 77.8% for Multi-step.
+- Average response time: Standard 3.04 s, Multi-step 10.23 s.
+- Standard's four excerpts cover 2.35% of the chunks. Global coverage was 37.5% vs. 41.7%; Multi-step can stop when intermediate evidence cannot be verified.
 
-Source coverage measures retrieved evidence, not answer correctness. The baseline will be used for comparison with future GraphRAG implementations.
+Detailed answers, sources and call counts are in [evaluation/baseline_answers.md](evaluation/baseline_answers.md). Use **Download evaluation report** to save an Evaluation run.
 
 ## Part 2 Graph & Schema
 
 - Neo4j integrated into Docker Compose
-- Document and chunk graph from the existing 14 documents
-- Knowledge graph with 19 business entities and source references
+- Document and chunk graph from the same 34 documents
+- Reviewed knowledge graph with 34 business entities and precise supporting chunks
 - Idempotent Python seed loading
 - 8 reproducible Cypher queries
-- LLM-guided Text2Cypher with validated query templates
+- LLM-guided Text2Cypher with validated, parameterized read templates
 - Vector RAG and Graph RAG selectable in the same streaming chat
-- Comparative evaluation on the same 12 questions
+- Comparative evaluation: Vector Standard, Vector Multi-step and Graph RAG
 - Backend, frontend and Neo4j integration tests
 
 ### Results and observations
 
-- Both systems completed 12/12 evaluation questions.
-- Average source coverage: Vector RAG 88.9%, Graph RAG 91.7%.
-- Local and multi-hop: 100% for both; global: 66.7% vs. 75.0%.
-- Average response time: Vector RAG 3.33 s, Graph RAG 3.74 s.
-- Graph RAG achieved higher source coverage, with slightly higher latency.
+- Graph RAG processed 12/12 questions, with 91.7% source coverage and a 6.46 s average response time.
+- Multi-hop and global source coverage reached 100%; latency fell between Standard and Multi-step.
+- Q04 is unsupported; Q12 omitted the 12-month retention rule for public training materials despite finding all expected documents.
 
-Source coverage measures retrieved evidence, not answer correctness. Results are based on a single local evaluation.
+Source coverage measures retrieved evidence, not answer correctness. Timings come from one local run per mode. Graph RAG uses reviewed relationships and selected evidence chunks, with no Vector fallback.
