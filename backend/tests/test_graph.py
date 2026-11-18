@@ -12,7 +12,7 @@ from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 from pydantic import ValidationError
 
-from app import chat, graph, graph_seed, main, rag
+from app import chat, graph, graph_seed, main, rag, evaluation
 
 ROOT = Path(__file__).resolve().parents[2]
 QUESTIONS = json.loads((ROOT / "evaluation/questions.json").read_text(encoding="utf-8"))
@@ -31,22 +31,30 @@ class SeedTests(unittest.TestCase):
         for node in nodes:
             if node["label"] in graph_seed.LABELS:
                 entities[node["id"]] = node
-                text = (rag.SEED_DIR / node["source_id"]).read_text(encoding="utf-8").casefold()
-                for key, value in node.items():
-                    if key not in ("id", "label", "source_id", "dataset", "chunk_ids"):
+                properties = node["properties"]
+                text = (rag.SEED_DIR / properties["source_id"]).read_text(encoding="utf-8").casefold()
+                for key, value in properties.items():
+                    if key not in ("id", "source_id", "dataset", "chunk_ids", "evidence_sources", "quotes", "description"):
                         self.assertIn(str(value).casefold(), text, (node["id"], key))
-        self.assertEqual(len(entities), len(graph_seed.NODES))
+        self.assertEqual(len(entities), len({item[0] for item in graph_seed.NODES}))
         self.assertEqual(len(nodes), len(set(node["id"] for node in nodes)))
         self.assertEqual(len(edges), len(set(edge["id"] for edge in edges)))
         adjacency = {}
         for entity_id in entities:
             adjacency[entity_id] = set()
         for edge in edges:
-            self.assertTrue((rag.SEED_DIR / edge["source_id"]).is_file())
-            self.assertEqual(edge["dataset"], graph_seed.DATASET)
+            properties = edge["properties"]
+            self.assertTrue((rag.SEED_DIR / properties["source_id"]).is_file())
+            self.assertEqual(properties["dataset"], graph_seed.DATASET)
             if edge["type"] in graph_seed.RELATION_TYPES:
                 start, end = edge["start"], edge["end"]
                 self.assertEqual((entities[start]["label"], entities[end]["label"]), graph_seed.RELATION_TYPES[edge["type"]])
+                for quote in properties["quotes"]:
+                    self.assertIn(entities[end]["properties"]["name"], quote)
+                    if edge["type"] == "AFFECTS":
+                        self.assertIn(entities[start]["properties"]["date"], quote)
+                    else:
+                        self.assertIn(entities[start]["properties"]["name"], quote)
                 adjacency[start].add(end)
                 adjacency[end].add(start)
         visited = set()
@@ -71,7 +79,7 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(len(documents), len(list(rag.SEED_DIR.rglob("*.md"))))
         self.assertEqual(set(chunks), set(ids))
         for document, chunk_id in zip(original, ids):
-            node = chunks[chunk_id]
+            node = chunks[chunk_id]["properties"]
             self.assertEqual(node["text"], document.page_content)
             self.assertEqual(node["source"], document.metadata["source"])
             self.assertEqual(node["chunk"], document.metadata["chunk"])
@@ -82,7 +90,7 @@ class SeedTests(unittest.TestCase):
             if edge["type"] == "CONTAINS":
                 contains.append(edge)
             if edge["type"] == "SUPPORTED_BY":
-                self.assertEqual(edge["end"], "document:" + edge["source_id"])
+                self.assertEqual(edge["end"], "document:" + edge["properties"]["source_id"])
         self.assertEqual(len(contains), len(original))
         self.assertEqual(graph_seed.seed_graph(), (nodes, edges))
 
@@ -102,8 +110,8 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(next_edges, list(zip(ids, ids[1:])))
         for node in nodes:
             if node["label"] == "Chunk":
-                self.assertEqual(node["page"], 0)
-                self.assertNotIn("section", node)
+                self.assertEqual(node["properties"]["page"], 0)
+                self.assertNotIn("section", node["properties"])
         with self.assertRaises(ValueError):
             graph_seed.document_graph(documents, ids[:-1])
         with self.assertRaises(ValueError):
@@ -112,19 +120,28 @@ class SeedTests(unittest.TestCase):
     def test_sync_is_parameterized_merge_scoped_and_never_calls_qdrant_or_openai(self):
         nodes, edges = graph_seed.seed_graph()
         tx = Mock()
+        tx.run.return_value.consume.return_value.counters.nodes_created = 0
+        tx.run.return_value.consume.return_value.counters.relationships_created = 0
         with patch.object(rag, "client") as vectors, patch.object(rag, "chat_model") as model:
             graph_seed.write_seed(tx, nodes, edges)
         vectors.assert_not_called()
         model.assert_not_called()
+        writes = 0
         for invocation in tx.run.call_args_list:
             statement = invocation.args[0]
             self.assertNotIn("Nóra", statement)
-            if statement.startswith("MERGE") or "MERGE (a)" in statement:
-                self.assertIn("$id", statement)
-                self.assertIn("properties", invocation.kwargs)
+            if "MERGE" in statement:
+                self.assertTrue(statement.startswith("UNWIND $rows AS row"))
+                self.assertIn("row.id", statement)
+                self.assertTrue(invocation.kwargs["rows"])
+                if "MERGE (a)" in statement:
+                    self.assertRegex(statement, r"MATCH \(a:(Entity|Chunk|Document) ")
+                    self.assertRegex(statement, r"\(b:(Entity|Chunk|Document) ")
+                writes += 1
             if "DELETE" in statement:
                 self.assertIn("$dataset", statement)
                 self.assertEqual(invocation.kwargs["dataset"], graph_seed.DATASET)
+        self.assertEqual(writes, len(graph_seed.LABELS) + 2 + len(graph_seed.EDGE_ENDPOINTS))
         invalid_nodes = [dict(nodes[0], label="Person) DETACH DELETE n //")]
         with self.assertRaises(ValueError):
             graph_seed.write_seed(Mock(), invalid_nodes, [])
@@ -165,7 +182,7 @@ class Text2CypherTests(unittest.TestCase):
             })
         with httpx.Client(transport=httpx.MockTransport(respond)) as client:
             def make_model(**options):
-                return ChatOpenAI(**options, api_key="offline-test-key", http_client=client)
+                return ChatOpenAI(**(options | {"api_key": "offline-test-key"}), http_client=client)
             with patch.dict(os.environ, {"OPENAI_CYPHER_MODEL": "gpt-6.1-sol"}), patch.object(graph, "ChatOpenAI", side_effect=make_model):
                 plan = graph.cypher_chain().invoke({"question": "Ki vezeti a Project Atlas projektet?"})
         self.assertEqual(plan.entity_id, "project:atlas")
@@ -209,6 +226,19 @@ class GraphRetrievalTests(unittest.TestCase):
 
     def tearDown(self):
         self.vectors.assert_not_called()
+
+    def test_upload_lookup_uses_exact_parameterized_filename_and_bounded_chunks(self):
+        self.read.return_value = [{"text": "The board approved the budget.", "source": "uploads/id/notes.md", "chunk": 2}]
+        context, sources, missing = graph.retrieve_upload("What budget was approved?", "notes.md", 4)
+        self.assertIsNone(missing)
+        self.assertIn("approved the budget", context)
+        self.assertEqual(sources[0]["reference"], "uploads/id/notes.md#2")
+        _, query, values = self.read.call_args.args
+        self.assertEqual(query, graph.UPLOAD_QUERY)
+        self.assertEqual(values, {"dataset": graph_seed.UPLOAD_DATASET, "filename": "notes.md",
+                                  "terms": ["approved", "budget", "was", "what"], "limit": 4})
+        self.read.return_value = []
+        self.assertEqual(graph.retrieve_upload("What was approved?", "missing.md", 4), ("", [], graph.MISSING_EVIDENCE))
 
     def test_two_hop_evidence_matches_the_baseline_source_identifiers(self):
         row = {"vendor": "ClearID Kft.", "project": "Project Bridge", "leader": "Tamás Fekete", "source_ids": ["vendors/clearid.md", "projects/bridge.md"], "chunk_ids": ["vendor", "project"]}
@@ -273,14 +303,27 @@ class GraphRetrievalTests(unittest.TestCase):
             nodes, edges = graph_seed.seed_graph()
             ids = [node["id"] for node in nodes]
             links = [edge["id"] for edge in edges]
-            row = {"ids": ids, "entities": len(graph_seed.NODES), "documents": 34, "chunks": 170}
+            proofs = list(graph.evidence_index(nodes).items())
+            edge_proofs = list(graph.evidence_index(edges).items())
+            row = {"ids": ids, "proofs": proofs, "entities": 34, "documents": 34, "chunks": 170, "uploads_ready": True}
+            relationships = Mock(single=Mock(return_value={"ids": links, "proofs": edge_proofs}))
             session = Mock()
             with patch.object(graph, "graph_session", return_value=MagicMock()) as sessions:
                 sessions.return_value.__enter__.return_value = session
-                session.run.side_effect = [Mock(single=Mock(return_value=row)), Mock(single=Mock(return_value={"ids": links}))]
+                session.run.side_effect = [Mock(single=Mock(return_value=row)), relationships]
                 self.assertTrue(graph.graph_status()["ready"])
                 stale = dict(row, ids=ids[:-1] + ["obsolete-id"])
-                session.run.side_effect = [Mock(single=Mock(return_value=stale)), Mock(single=Mock(return_value={"ids": links}))]
+                session.run.side_effect = [Mock(single=Mock(return_value=stale)), relationships]
+                self.assertFalse(graph.graph_status()["ready"])
+                legacy = dict(row, proofs=[])
+                session.run.side_effect = [Mock(single=Mock(return_value=legacy)), relationships]
+                status = graph.graph_status()
+                self.assertFalse(status["ready"])
+                self.assertTrue(status["uploads_ready"])
+                identity, (sources, _, chunks) = edge_proofs[0]
+                changed_proofs = [(identity, [sources, ["Outdated quote"], chunks])] + edge_proofs[1:]
+                changed = Mock(single=Mock(return_value={"ids": links, "proofs": changed_proofs}))
+                session.run.side_effect = [Mock(single=Mock(return_value=row)), changed]
                 self.assertFalse(graph.graph_status()["ready"])
 
 
@@ -288,15 +331,18 @@ class GraphApiTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(main.app)
         self.addCleanup(self.client.close)
+        seed_dir = patch.object(rag, "SEED_DIR", ROOT / "data/seed")
+        seed_dir.start()
+        self.addCleanup(seed_dir.stop)
         for name, result in (("corpus_status", {"seed_ready": True}), ("graph_status", {"ready": True})):
-            readiness = patch.object(main, name, return_value=result)
+            readiness = patch.object(evaluation, name, return_value=result)
             readiness.start()
             self.addCleanup(readiness.stop)
 
     def test_evaluations_use_same_questions_categories_and_separate_retrieval(self):
         vector_result = {"answer": "Vector answer", "sources": [SOURCE]}
         graph_result = {"answer": graph.MISSING_EVIDENCE, "sources": []}
-        with patch.object(main, "Path", return_value=ROOT / "evaluation/questions.json"), patch.object(main, "answer", return_value=vector_result) as vector, patch.object(main, "graph_answer", return_value=graph_result) as graphs:
+        with patch.object(main, "Path", return_value=ROOT / "evaluation/questions.json"), patch.object(evaluation, "answer", return_value=vector_result) as vector, patch.object(evaluation, "graph_answer", return_value=graph_result) as graphs:
             vector_run = self.client.post("/api/evaluate", json={"system": "vector", "mode": "multi-step", "top_k": 12}).json()
             graphs.assert_not_called()
             graph_run = self.client.post("/api/evaluate", json={"system": "graph", "top_k": 12}).json()
@@ -322,15 +368,27 @@ class GraphApiTests(unittest.TestCase):
             response = self.client.get("/api/graph")
         self.assertEqual(response.status_code, 503)
         self.assertNotIn("private password", response.text)
-        with patch.object(main, "Path", return_value=ROOT / "evaluation/questions.json"), patch.object(main, "graph_answer", side_effect=RuntimeError("private password")), patch.object(main, "answer") as vectors:
-            evaluation = self.client.post("/api/evaluate", json={"system": "graph"}).json()
-        self.assertEqual(evaluation["summary"]["successful"], 0)
-        self.assertEqual(len(evaluation["results"]), 12)
-        self.assertNotIn("private password", str(evaluation))
+        with patch.object(main, "Path", return_value=ROOT / "evaluation/questions.json"), patch.object(evaluation, "graph_answer", side_effect=RuntimeError("private password")), patch.object(evaluation, "answer") as vectors:
+            evaluated = self.client.post("/api/evaluate", json={"system": "graph"}).json()
+        self.assertEqual(evaluated["summary"]["successful"], 0)
+        self.assertEqual(len(evaluated["results"]), 12)
+        self.assertNotIn("private password", str(evaluated))
         vectors.assert_not_called()
 
 
 class GraphStreamingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_upload_search_uses_the_graph_document_query_and_existing_stream(self):
+        with patch.object(chat, "retrieve_upload", return_value=("", [], graph.MISSING_EVIDENCE)) as uploads, patch.object(chat, "retrieve_graph_async") as planner, patch.object(chat, "client") as vectors:
+            response = await main.chat_stream(main.StreamChatRequest(question="What was approved?", mode="graph", filename="notes.md"),
+                                              Mock(is_disconnected=AsyncMock(return_value=False)))
+            events = []
+            async for frame in response.body_iterator:
+                events.append(json.loads(frame.removeprefix("data: ")))
+        uploads.assert_called_once_with("What was approved?", "notes.md", 4)
+        planner.assert_not_called()
+        vectors.assert_not_called()
+        self.assertEqual([event["type"] for event in events], ["sources", "token", "done"])
+
     async def test_async_planner_validates_before_running_graph_retrieval(self):
         planner = Mock(ainvoke=AsyncMock(return_value={"operation": "project_leader", "entity_id": "project:atlas"}))
         expected = ("facts", [SOURCE], None)
@@ -349,7 +407,7 @@ class GraphStreamingTests(unittest.IsolatedAsyncioTestCase):
             yield "Nóra "
             yield "Varga"
         chain = Mock(astream=tokens)
-        with patch.object(chat, "require_key"), patch.object(chat, "retrieve_graph_async", new=AsyncMock(return_value=("Graph facts", [SOURCE], None))) as retrieve, patch.object(chat, "client") as vectors, patch.object(chat, "answer_chain", return_value=chain):
+        with patch.object(chat, "retrieve_graph_async", new=AsyncMock(return_value=("Graph facts", [SOURCE], None))) as retrieve, patch.object(chat, "client") as vectors, patch.object(chat, "answer_chain", return_value=chain):
             events = []
             async for event in chat.stream_answer("Who leads Atlas?", 4, "graph"):
                 events.append(event)
@@ -359,7 +417,7 @@ class GraphStreamingTests(unittest.IsolatedAsyncioTestCase):
         vectors.assert_not_called()
 
     async def test_missing_graph_information_skips_answer_model(self):
-        with patch.object(chat, "require_key"), patch.object(chat, "retrieve_graph_async", new=AsyncMock(return_value=("", [], graph.MISSING_EVIDENCE))), patch.object(chat, "answer_chain") as model, patch.object(chat, "client") as vectors:
+        with patch.object(chat, "retrieve_graph_async", new=AsyncMock(return_value=("", [], graph.MISSING_EVIDENCE))), patch.object(chat, "answer_chain") as model, patch.object(chat, "client") as vectors:
             events = []
             async for event in chat.stream_answer("Unknown project?", 4, "graph"):
                 events.append(event)
@@ -375,7 +433,7 @@ class GraphStreamingTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
             finally:
                 closed.append(True)
-        with patch.object(chat, "require_key"), patch.object(chat, "retrieve_graph_async", new=AsyncMock(return_value=("facts", [SOURCE], None))), patch.object(chat, "answer_chain", return_value=Mock(astream=tokens)):
+        with patch.object(chat, "retrieve_graph_async", new=AsyncMock(return_value=("facts", [SOURCE], None))), patch.object(chat, "answer_chain", return_value=Mock(astream=tokens)):
             stream = chat.stream_answer("Who leads Atlas?", 4, "graph")
             await anext(stream)
             await anext(stream)
@@ -386,7 +444,7 @@ class GraphStreamingTests(unittest.IsolatedAsyncioTestCase):
         async def fail(inputs):
             yield "Partial answer"
             raise RuntimeError("private database details")
-        with patch.object(chat, "require_key"), patch.object(chat, "retrieve_graph_async", new=AsyncMock(return_value=("facts", [SOURCE], None))), patch.object(chat, "answer_chain", return_value=Mock(astream=fail)), TestClient(main.app) as client:
+        with patch.object(chat, "retrieve_graph_async", new=AsyncMock(return_value=("facts", [SOURCE], None))), patch.object(chat, "answer_chain", return_value=Mock(astream=fail)), TestClient(main.app) as client:
             response = client.post("/api/chat/stream", json={"question": "Atlas project?", "mode": "graph"})
         self.assertEqual(response.status_code, 200)
         self.assertIn("Partial answer", response.text)

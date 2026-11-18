@@ -1,14 +1,18 @@
 import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier
 from unittest.mock import Mock, patch
+from uuid import NAMESPACE_URL, uuid5
 from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
+from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableLambda
 from openpyxl import Workbook
@@ -16,7 +20,7 @@ from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from qdrant_client import QdrantClient, models
 
-from app import main, rag, uploads
+from app import graph_seed, main, rag, uploads
 
 PROJECT = Path(__file__).resolve().parents[2]
 TEXT = "Uploaded knowledge for testing."
@@ -79,14 +83,24 @@ class UploadTests(unittest.TestCase):
         self.stack.enter_context(patch.object(uploads, "UPLOAD_DIR", self.root))
         self.stack.enter_context(patch.object(uploads, "client", return_value=self.db))
         self.stack.enter_context(patch.object(rag, "client", return_value=self.db))
-        self.stack.enter_context(patch.object(uploads, "require_key"))
-        self.stack.enter_context(patch.object(rag, "require_key"))
+        self.graph_nodes = {}
+        self.graph_edges = {}
+        self.graph = self.stack.enter_context(patch.object(uploads, "sync_upload", side_effect=self.save_graph))
         self.stack.enter_context(patch.dict(os.environ, {"LANGSMITH_TRACING": "false", "LANGCHAIN_TRACING_V2": "false"}))
         self.embeddings = FakeEmbeddings()
         self.stack.enter_context(patch.object(rag, "OpenAIEmbeddings", return_value=self.embeddings))
         self.stack.enter_context(patch.object(rag, "ChatOpenAI", return_value=RunnableLambda(lambda prompt: "Generated answer.")))
         self.client = TestClient(main.app)
         self.addCleanup(self.client.close)
+
+    def save_graph(self, documents, ids):
+        nodes, edges = graph_seed.document_graph(documents, ids, graph_seed.UPLOAD_DATASET)
+        before = (len(self.graph_nodes), len(self.graph_edges))
+        for node in nodes:
+            self.graph_nodes[node["id"]] = node
+        for edge in edges:
+            self.graph_edges[edge["id"]] = edge
+        return before != (len(self.graph_nodes), len(self.graph_edges))
 
     def test_all_six_formats_are_loaded_saved_and_indexed(self):
         for name, content in sample_files().items():
@@ -107,6 +121,12 @@ class UploadTests(unittest.TestCase):
                     self.assertNotIn("FORMULA_MUST_NOT_RUN", point.payload["page_content"])
                     self.assertEqual(point.payload["metadata"]["source"], result["source"])
                     self.assertEqual(point.payload["metadata"]["kind"], "upload")
+                    chunk = self.graph_nodes[str(point.id)]["properties"]
+                    self.assertEqual(chunk["text"], point.payload["page_content"])
+                    self.assertEqual(chunk["source"], result["source"])
+                    for key in ("page", "sheet"):
+                        if key in point.payload["metadata"]:
+                            self.assertEqual(chunk[key], point.payload["metadata"][key])
 
     def test_renamed_duplicate_preserves_source_and_skips_embeddings(self):
         first = uploads.upload_document("notes.md", TEXT.encode())
@@ -179,6 +199,68 @@ class UploadTests(unittest.TestCase):
         self.assertNotIn(str(existing[0].id), added_ids)
         self.assertEqual(len(added_ids), result["chunks"] - 1)
         self.assertEqual(self.db.count(rag.COLLECTION).count, result["chunks"])
+        self.assertEqual({node_id for node_id, node in self.graph_nodes.items() if node["label"] == "Chunk"},
+                         {str(point.id) for point in self.db.scroll(rag.COLLECTION)[0]})
+
+    def test_graph_failure_is_visible_and_retry_repairs_it_without_embedding_again(self):
+        data = {"file": ("notes.txt", TEXT.encode())}
+        self.graph.side_effect = RuntimeError("private graph error")
+        failed = self.client.post("/api/ingest/upload", files=data)
+        self.assertEqual(failed.status_code, 502)
+        self.assertNotIn("private graph error", failed.text)
+        self.assertIn("Retry the same file", failed.json()["detail"])
+        self.assertEqual(len(self.graph_nodes), 0)
+        self.assertEqual(self.db.count(rag.COLLECTION).count, 1)
+        calls = len(self.embeddings.calls)
+        self.graph.side_effect = self.save_graph
+        recovered = self.client.post("/api/ingest/upload", files=data).json()
+        self.assertFalse(recovered["unchanged"])
+        self.assertTrue(self.client.post("/api/ingest/upload", files=data).json()["unchanged"])
+        self.assertEqual(len(self.embeddings.calls), calls)
+        self.assertEqual(len(self.graph_nodes), 2)
+
+    def test_retry_repairs_truncated_legacy_file_and_removes_its_obsolete_vector(self):
+        content = b"The complete approved budget and scope."
+        identity = sha256(content).hexdigest()
+        directory = self.root / identity
+        directory.mkdir()
+        local_file = directory / "original.txt"
+        local_file.write_bytes(b"The complete")
+        rag.ensure_collection(self.db)
+        obsolete = str(uuid5(NAMESPACE_URL, "old-upload-chunk"))
+        partial = Document(page_content="The complete", metadata={"source": f"uploads/{identity}/original.txt",
+                           "document_id": identity, "chunk": 0, "kind": "upload"})
+        rag.store(self.db).add_documents([partial], ids=[obsolete])
+
+        result = uploads.upload_document("renamed.txt", content)
+        self.assertEqual(result["filename"], "original.txt")
+        self.assertEqual(local_file.read_bytes(), content)
+        points, _ = self.db.scroll(rag.COLLECTION)
+        self.assertEqual(len(points), 1)
+        self.assertNotEqual(str(points[0].id), obsolete)
+        self.assertEqual(self.graph_nodes[str(points[0].id)]["properties"]["text"], content.decode())
+
+    def test_parallel_first_publication_keeps_one_complete_file_and_stable_ids(self):
+        barrier = Barrier(2, timeout=5)
+        original = uploads.read_chunks
+        content = TEXT.encode()
+
+        def read_chunks(path):
+            if path.parent.name.startswith(".upload-"):
+                barrier.wait()
+            return original(path)
+
+        with patch.object(uploads, "read_chunks", side_effect=read_chunks), patch.object(uploads, "index_upload", return_value=True) as index:
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                first = workers.submit(uploads.upload_document, "first.txt", content)
+                second = workers.submit(uploads.upload_document, "second.txt", content)
+                results = [first.result(timeout=10), second.result(timeout=10)]
+        self.assertEqual(results[0]["source"], results[1]["source"])
+        self.assertEqual(index.call_args_list[0].args[1], index.call_args_list[1].args[1])
+        directory = self.root / results[0]["document_id"]
+        self.assertEqual(list(directory.iterdir()), [directory / results[0]["filename"]])
+        self.assertEqual((directory / results[0]["filename"]).read_bytes(), content)
+        self.assertEqual(list(self.root.iterdir()), [directory])
 
     def test_upload_only_corpus_can_be_chatted_but_not_evaluated_as_seed(self):
         uploads.upload_document("notes.txt", TEXT.encode())

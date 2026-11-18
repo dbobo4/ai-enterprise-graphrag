@@ -13,7 +13,7 @@ from langchain_core.runnables import RunnableLambda
 from pydantic import ValidationError
 from qdrant_client import QdrantClient, models
 
-from app import chat, main, rag
+from app import chat, main, rag, evaluation
 
 VENDOR = Document(page_content="ClearID provides verification services for Project Bridge.", metadata={"source": "vendors/clearid.md", "chunk": 0})
 PROJECT = Document(page_content="Project Bridge is led by Tamás Fekete.", metadata={"source": "projects/bridge.md", "chunk": 0})
@@ -28,7 +28,6 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.stack.close)
         self.db = Mock()
         self.retriever = Mock(ainvoke=AsyncMock(return_value=[VENDOR]))
-        self.stack.enter_context(patch.object(chat, "require_key"))
         self.stack.enter_context(patch.object(chat, "client", return_value=self.db))
         self.make_retriever = self.stack.enter_context(patch.object(chat, "make_retriever", return_value=self.retriever))
         self.closed = False
@@ -275,13 +274,13 @@ class StreamApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_streaming_chat_and_evaluation_remain_standard_and_seed_scoped(self):
         answer = {"answer": "Answer", "sources": [], "top_k": 4}
         questions_path = Path(__file__).resolve().parents[2] / "evaluation" / "questions.json"
-        with TestClient(main.app) as client, patch.object(main, "answer", return_value=answer) as respond, patch.object(main, "stream_answer") as stream, patch.object(main, "Path", return_value=questions_path), patch.object(main, "corpus_status", return_value={"seed_ready": True}):
+        with TestClient(main.app) as client, patch.object(evaluation, "answer", return_value=answer) as respond, patch.object(main, "answer", respond), patch.object(main, "stream_answer") as stream, patch.object(main, "Path", return_value=questions_path), patch.object(evaluation, "corpus_status", return_value={"seed_ready": True}):
             response = client.post("/api/chat", json={"question": "ClearID project?", "mode": "multi-step"})
             self.assertEqual(response.json(), answer)
             respond.assert_called_once_with("ClearID project?", 4)
             respond.reset_mock()
-            evaluation = client.post("/api/evaluate", json={"mode": "multi-step", "top_k": 12}).json()
-            self.assertEqual(evaluation["summary"]["successful"], 12)
+            evaluated = client.post("/api/evaluate", json={"mode": "multi-step", "top_k": 12}).json()
+            self.assertEqual(evaluated["summary"]["successful"], 12)
             self.assertEqual(respond.call_count, 12)
             for invocation in respond.call_args_list:
                 self.assertEqual(invocation.args[1], 4)
@@ -313,8 +312,6 @@ class StreamRetrievalTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(db, "close"))
             stack.enter_context(patch.object(chat, "client", return_value=db))
             stack.enter_context(patch.object(rag, "client", return_value=db))
-            stack.enter_context(patch.object(chat, "require_key"))
-            stack.enter_context(patch.object(rag, "require_key"))
             stack.enter_context(patch.object(rag, "OpenAIEmbeddings", return_value=embeddings))
             stack.enter_context(patch.object(rag, "ChatOpenAI", return_value=RunnableLambda(lambda inputs: "Answer")))
             stack.enter_context(patch.object(chat, "chat_model", return_value=model))

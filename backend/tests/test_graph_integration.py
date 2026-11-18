@@ -3,6 +3,7 @@
 import json
 import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 from uuid import NAMESPACE_URL, uuid5
@@ -10,6 +11,7 @@ from uuid import NAMESPACE_URL, uuid5
 from langchain_core.documents import Document
 
 from app import graph, graph_seed, rag
+from app.config import Settings
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -17,11 +19,9 @@ ROOT = Path(__file__).resolve().parents[2]
 @unittest.skipUnless(os.getenv("TEST_NEO4J_URI") and os.getenv("TEST_NEO4J_DISPOSABLE") == "yes", "NOT RUN: requires an explicitly disposable empty Neo4j")
 class Neo4jIntegrationTests(unittest.TestCase):
     def test_real_sync_idempotence_document_graph_queries_and_evaluation_sources(self):
-        settings = {
-            "NEO4J_URI": os.environ["TEST_NEO4J_URI"], "NEO4J_USERNAME": "neo4j", "NEO4J_DATABASE": "neo4j",
-            "NEO4J_PASSWORD": os.getenv("TEST_NEO4J_PASSWORD", "enterprise-demo-password"),
-        }
-        with patch.dict(os.environ, settings), patch.object(rag, "SEED_DIR", ROOT / "data/seed"):
+        settings = Settings(neo4j_uri=os.environ["TEST_NEO4J_URI"], neo4j_username="neo4j", neo4j_database="neo4j",
+                            neo4j_password=os.getenv("TEST_NEO4J_PASSWORD", "enterprise-demo-password"))
+        with patch.object(graph, "get_settings", return_value=settings), patch.object(rag, "SEED_DIR", ROOT / "data/seed"):
             with graph.graph_driver() as driver, graph.graph_session(driver) as session:
                 count = session.run("MATCH (n) RETURN count(n) AS count").single()["count"]
                 self.assertEqual(count, 0, "Refusing to test a nonempty database; use a disposable container without volumes.")
@@ -34,7 +34,7 @@ class Neo4jIntegrationTests(unittest.TestCase):
                 self.assertEqual(graph_seed.sync_seed(), first)
                 self.assertEqual(session.run("MATCH (n) RETURN n.id AS id, properties(n) AS properties ORDER BY id").data(), before)
                 self.assertEqual(session.run("MATCH (a)-[r]->(b) RETURN a.id AS start, b.id AS end, type(r) AS kind, properties(r) AS properties ORDER BY start, kind, end").data(), edges_before)
-                self.assertEqual(first, {"entities": len(graph_seed.NODES), "documents": document_count, "chunks": len(original), "relationships": len(edges)})
+                self.assertEqual(first, {"entities": len({item[0] for item in graph_seed.NODES}), "documents": document_count, "chunks": len(original), "relationships": len(edges)})
                 self.assertTrue(graph.graph_status()["ready"])
 
                 text = (ROOT / "backend/graph.cypher").read_text(encoding="utf-8")
@@ -64,7 +64,7 @@ class Neo4jIntegrationTests(unittest.TestCase):
                 self.assertEqual(len(results[5]), sum(node[1] == "Vendor" for node in graph_seed.NODES))
                 for row in results[5]:
                     self.assertGreaterEqual(row["projects"], 1)
-                self.assertEqual(len(results[6]), len(graph_seed.RELATIONSHIPS))
+                self.assertEqual(len(results[6]), len({item[:3] for item in graph_seed.RELATIONSHIPS}))
                 self.assertEqual({row["source"] for row in results[7]}, {"incidents/atlas.md", "vendors/novacloud.md", "vendors/safedesk.md"})
 
                 plans = [
@@ -100,6 +100,30 @@ class Neo4jIntegrationTests(unittest.TestCase):
                 # Reverting the fixture removes only obsolete records from this managed dataset.
                 self.assertEqual(graph_seed.sync_seed(), first)
                 self.assertEqual(session.run("MATCH (n) WHERE n.source = 'test/sequence.md' RETURN count(n) AS count").single()["count"], 0)
+
+                uploaded = []
+                for index, document in enumerate(fixture):
+                    metadata = {"source": "uploads/fixture/sequence.md", "document_id": "fixture", "filename": "sequence.md",
+                                "chunk": index, "kind": "upload", "page": index}
+                    uploaded.append(Document(page_content=document.page_content, metadata=metadata))
+                graph_seed.sync_upload(uploaded, fixture_ids)
+                with ThreadPoolExecutor(max_workers=2) as workers:
+                    first_write = workers.submit(graph_seed.sync_upload, uploaded, fixture_ids)
+                    second_write = workers.submit(graph_seed.sync_upload, uploaded, fixture_ids)
+                    self.assertFalse(first_write.result(timeout=15))
+                    self.assertFalse(second_write.result(timeout=15))
+                self.assertEqual(graph_seed.sync_seed(), first)
+                record = session.run(
+                    "MATCH (d:Document {dataset: $dataset})-[:CONTAINS]->(c:Chunk)-[r:NEXT_CHUNK]->(:Chunk) "
+                    "RETURN count(DISTINCT d) AS documents, count(r) AS links",
+                    dataset=graph_seed.UPLOAD_DATASET,
+                ).single()
+                self.assertEqual((record["documents"], record["links"]), (1, len(uploaded) - 1))
+                _, sources, missing = graph.retrieve_upload("multi chunk", "sequence.md", 4)
+                self.assertIsNone(missing)
+                self.assertTrue(sources)
+                self.assertTrue(all(source["source"] == "uploads/fixture/sequence.md" for source in sources))
+                self.assertTrue(graph.graph_status()["uploads_ready"])
 
 
 if __name__ == "__main__":

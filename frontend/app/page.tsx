@@ -10,9 +10,10 @@ type UploadResult = { filename: string; unchanged: boolean };
 export default function Home() {
   const [corpus, setCorpus] = useState<CorpusStatus | null>(null);
   const [available, setAvailable] = useState(true);
-  const [graph, setGraph] = useState<{ ready: boolean } | null>(null);
+  const [graph, setGraph] = useState<{ ready: boolean; uploads_ready: boolean } | null>(null);
   const [graphAvailable, setGraphAvailable] = useState(true);
   const [system, setSystem] = useState<SearchSystem>("vector");
+  const [graphFilename, setGraphFilename] = useState("");
   const [question, setQuestion] = useState("");
   const [result, setResult] = useState<ChatResult | null>(null);
   const [message, setMessage] = useState("");
@@ -23,6 +24,7 @@ export default function Home() {
   const [mode, setMode] = useState<VectorMode>("standard");
   const [streaming, setStreaming] = useState(false);
   const controller = useRef<AbortController | null>(null);
+  const graphReady = graphFilename.trim() ? graph?.uploads_ready : graph?.ready;
 
   async function refresh() {
     try {
@@ -73,7 +75,7 @@ export default function Home() {
     controller.current = current;
     setBusy(true); setStreaming(true); setMessage("Searching documents…"); setResult(null);
     try {
-      const response = await requestChat(question, system, mode, current.signal);
+      const response = await requestChat(question, system, mode, current.signal, graphFilename.trim() || undefined);
       await readChatStream(response, event => {
         if (event.type === "sources") {
           setResult({ answer: "", sources: event.sources, top_k: event.top_k });
@@ -108,7 +110,7 @@ export default function Home() {
       }
       const result: UploadResult = await response.json();
       setUploadMessage(`${result.filename} ${result.unchanged ? "is already available." : "is ready to search."}`);
-      await refresh();
+      await Promise.all([refresh(), refreshGraph()]);
     } catch {
       setUploadError(true);
       setUploadMessage(`${file.name}: ${failure}`);
@@ -121,7 +123,7 @@ export default function Home() {
       <p className="muted">Search company documents and your uploads, and explore their sources.</p>
       {((system === "vector" && !available) || (system === "graph" && !graphAvailable)) && <p role="status">Knowledge base is unavailable.</p>}
       <div className="columns">
-        <section className="panel">
+        <section className={system === "graph" ? "panel graph-chat" : "panel"}>
           <h2>Chat</h2>
           <label htmlFor="search-system" className="muted">Search system</label>
           <select id="search-system" value={system} disabled={busy} onChange={event => setSystem(event.target.value as SearchSystem)}>
@@ -133,10 +135,15 @@ export default function Home() {
             <option value="standard">Standard</option><option value="multi-step">Multi-step</option>
           </select>
           </>}
-          {system === "graph" && <p className="muted">Search relationships and facts in the built-in company documents.</p>}
+          {system === "graph" && <div className="graph-filename">
+            <label htmlFor="graph-filename" className="muted">Uploaded filename (optional)</label>
+            <input id="graph-filename" type="text" value={graphFilename} maxLength={100} disabled={busy}
+              onChange={event => setGraphFilename(event.target.value)} placeholder="e.g. minutes.pdf" aria-describedby="graph-filename-help" />
+            <small id="graph-filename-help" className="muted">Leave blank to search company facts.</small>
+          </div>}
           <label htmlFor="question" className="muted">Your question</label>
           <textarea id="question" value={question} onChange={event => setQuestion(event.target.value)} placeholder="Ki vezeti az Atlas projektet?" />
-          <button onClick={ask} disabled={busy || !(system === "graph" ? graphAvailable && graph?.ready : available && corpus?.ready) || question.trim().length < 3}>Ask</button>
+          <button onClick={ask} disabled={busy || !(system === "graph" ? graphAvailable && graphReady : available && corpus?.ready) || question.trim().length < 3}>Ask</button>
           {streaming && <button className="stop" onClick={() => controller.current?.abort()}>Stop</button>}
           {message && <p className="muted" role="status">{message}</p>}
           {result && <div className="answer"><h2>Answer</h2><p>{result.answer}</p><h2 className="section-title">Sources</h2>
@@ -147,11 +154,10 @@ export default function Home() {
           <h2>Documents</h2>
           {corpus && <p className="muted">{corpus.documents} built-in documents available.</p>}
           {system === "vector" && corpus?.ready && <p className="muted">Ready to search.</p>}
-          {system === "graph" && <p className="muted">{graph?.ready ? "Graph search is ready." : "Graph search is not ready."}</p>}
+          {system === "graph" && <p className="muted">{graphReady ? "Graph search is ready." : "Graph search is not ready."}</p>}
           {system === "vector" && corpus && !corpus.seed_ready && <button onClick={indexCorpus} disabled={busy}>Prepare documents</button>}
           <h2 className="section-title">Upload a document</h2>
           <p className="muted">TXT, MD, PDF, DOCX, HTML or XLSX · Up to 10 MB</p>
-          {system === "graph" && <p className="muted">Uploaded documents are available in Vector RAG.</p>}
           <label htmlFor="document" className="muted">Choose a document</label>
           <input id="document" type="file" accept=".txt,.md,.pdf,.docx,.html,.xlsx" disabled={busy}
             onChange={event => { setFile(event.target.files?.[0] ?? null); setUploadMessage(""); }} />

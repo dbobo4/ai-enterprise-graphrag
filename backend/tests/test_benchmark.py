@@ -17,7 +17,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableLambda
 from qdrant_client import QdrantClient
 
-from app import chat, graph, graph_seed, main, rag
+from app import chat, graph, graph_seed, main, rag, evaluation
 from app.evaluation import run_evaluation
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -64,9 +64,9 @@ class MultiStepConnectionTests(unittest.TestCase):
                 environment = {"OPENAI_API_KEY": "offline-test-key", "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
                                "OPENAI_CHAT_MODEL": "gpt-6-luna", "LANGSMITH_TRACING": "false", "LANGCHAIN_TRACING_V2": "false"}
                 with patch.dict(os.environ, environment), TestClient(main.app) as api, ExitStack() as stack:
-                    stack.enter_context(patch.object(main, "questions", return_value=QUESTIONS))
-                    stack.enter_context(patch.object(main, "corpus_status", return_value={"seed_ready": True}))
-                    stack.enter_context(patch.object(main, "seed_manifest", return_value={"fingerprint": "offline"}))
+                    stack.enter_context(patch.object(main, "load_questions", return_value=QUESTIONS))
+                    stack.enter_context(patch.object(evaluation, "corpus_status", return_value={"seed_ready": True}))
+                    stack.enter_context(patch.object(evaluation, "seed_manifest", return_value={"documents": 34, "chunks": 170, "top_k": 4, "fingerprint": "offline"}))
                     stack.enter_context(patch.object(chat, "client", return_value=Mock()))
                     make = stack.enter_context(patch.object(chat, "make_retriever", return_value=Mock(ainvoke=AsyncMock(return_value=[document]))))
                     model = rag.chat_model()
@@ -104,17 +104,16 @@ class MultiStepConnectionTests(unittest.TestCase):
             yield "Offline grounded answer"
         chain = Mock(ainvoke=AsyncMock(return_value="Offline grounded answer"), astream=Mock(side_effect=tokens))
         with TestClient(main.app) as api, ExitStack() as stack:
-            stack.enter_context(patch.object(main, "questions", return_value=QUESTIONS))
-            stack.enter_context(patch.object(main, "corpus_status", return_value={"seed_ready": True}))
-            stack.enter_context(patch.object(main, "seed_manifest", return_value={"fingerprint": "offline"}))
-            stack.enter_context(patch.object(chat, "require_key"))
+            stack.enter_context(patch.object(main, "load_questions", return_value=QUESTIONS))
+            stack.enter_context(patch.object(evaluation, "corpus_status", return_value={"seed_ready": True}))
+            stack.enter_context(patch.object(evaluation, "seed_manifest", return_value={"documents": 34, "chunks": 170, "top_k": 4, "fingerprint": "offline"}))
             db = stack.enter_context(patch.object(chat, "client", return_value=Mock()))
             make = stack.enter_context(patch.object(chat, "make_retriever", return_value=Mock()))
             shared = stack.enter_context(patch.object(chat, "multi_step_documents", side_effect=documents))
             stack.enter_context(patch.object(chat, "answer_chain", return_value=chain))
-            evaluation = api.post("/api/evaluate", json={"system": "multi-step"})
+            evaluated = api.post("/api/evaluate", json={"system": "multi-step"})
             stream = api.post("/api/chat/stream", json={"question": "Offline question?", "mode": "multi-step"})
-        self.assertEqual(evaluation.json()["summary"]["successful"], 12)
+        self.assertEqual(evaluated.json()["summary"]["successful"], 12)
         self.assertEqual(shared.await_count, 13)
         self.assertTrue(all(loop is loops[0] for loop in loops))
         self.assertEqual(make.call_args_list[:-1], [call(db.return_value, 4, True)] * 12)
@@ -132,10 +131,9 @@ class MultiStepConnectionTests(unittest.TestCase):
                     if item["id"] == question_id:
                         question = item
                         break
-                stack.enter_context(patch.object(main, "questions", return_value=[question]))
-                stack.enter_context(patch.object(main, "corpus_status", return_value={"seed_ready": True}))
-                stack.enter_context(patch.object(main, "seed_manifest", return_value={"fingerprint": "offline"}))
-                stack.enter_context(patch.object(chat, "require_key"))
+                stack.enter_context(patch.object(main, "load_questions", return_value=[question]))
+                stack.enter_context(patch.object(evaluation, "corpus_status", return_value={"seed_ready": True}))
+                stack.enter_context(patch.object(evaluation, "seed_manifest", return_value={"documents": 34, "chunks": 170, "top_k": 4, "fingerprint": "offline"}))
                 db = stack.enter_context(patch.object(chat, "client", return_value=Mock()))
                 retriever = Mock(ainvoke=AsyncMock(return_value=[document]))
                 stack.enter_context(patch.object(chat, "make_retriever", return_value=retriever))
@@ -249,24 +247,25 @@ class CorpusTests(unittest.TestCase):
                 entities[node["id"]] = node
         self.assertEqual(len(entities), 34)
         for record in list(entities.values()) + edges:
-            if "quote" not in record:
+            proof = record["properties"]
+            if "quotes" not in proof:
                 continue
-            self.assertTrue(record["chunk_ids"])
-            self.assertLess(len(record["chunk_ids"]), 3)
-            for chunk_id in record["chunk_ids"]:
-                chunk = chunks[chunk_id]
-                self.assertEqual(chunk["source"], record["source_id"])
-                self.assertIn(record["quote"].casefold(), chunk["text"].casefold())
+            self.assertTrue(proof["chunk_ids"])
+            for source, quote, chunk_id in zip(proof["evidence_sources"], proof["quotes"], proof["chunk_ids"], strict=True):
+                chunk = chunks[chunk_id]["properties"]
+                self.assertEqual(chunk["source"], source)
+                self.assertIn(quote, chunk["text"])
         next_edges = []
         for edge in edges:
             if edge["type"] == "NEXT_CHUNK":
-                first, second = chunks[edge["start"]], chunks[edge["end"]]
+                first = chunks[edge["start"]]["properties"]
+                second = chunks[edge["end"]]["properties"]
                 self.assertEqual(first["source"], second["source"])
                 self.assertEqual(first["chunk"] + 1, second["chunk"])
                 next_edges.append(edge)
         self.assertEqual(len(next_edges), len(chunks) - 34)
         assignments = set()
-        for start, kind, end, _ in graph_seed.RELATIONSHIPS:
+        for start, kind, end, _, _ in graph_seed.RELATIONSHIPS:
             if kind == "SUPPLIES":
                 assignments.add((start, end))
         self.assertIn(("vendor:dataloom", "project:atlas-archive"), assignments)
@@ -274,6 +273,29 @@ class CorpusTests(unittest.TestCase):
         self.assertIn(("vendor:clearid", "project:bridge"), assignments)
         self.assertIn(("vendor:clearid-audit", "project:bridge-north"), assignments)
         self.assertIn(("vendor:safedesk", "project:atlas"), assignments)
+
+    def test_repeated_entities_and_edges_keep_all_original_evidence(self):
+        nodes, edges = graph_seed.seed_graph()
+        people = []
+        employment = []
+        for node in nodes:
+            if node["id"] == "person:nora-varga":
+                people.append(node["properties"])
+        for edge in edges:
+            if edge["start"] == "person:nora-varga" and edge["type"] == "WORKS_IN":
+                employment.append(edge["properties"])
+        self.assertEqual((len(people), len(employment)), (1, 1))
+        sources = ["people/roles.md", "emails/atlas-window.md"]
+        self.assertEqual(people[0]["evidence_sources"], sources)
+        self.assertEqual(employment[0]["evidence_sources"], sources)
+        self.assertIn("From: Nóra Varga, IT.", employment[0]["quotes"])
+        self.assertNotIn(people[0]["description"], people[0]["quotes"])
+
+    def test_an_inexact_business_quote_fails_seed_build(self):
+        start, kind, end, source, quote = graph_seed.RELATIONSHIPS[0]
+        broken = [(start, kind, end, source, quote.lower())]
+        with patch.object(graph_seed, "RELATIONSHIPS", broken), self.assertRaisesRegex(ValueError, "No exact supporting chunk"):
+            graph_seed.seed_graph()
 
 
 class OfflineEmbeddings(Embeddings):
@@ -294,7 +316,6 @@ class SeedSyncTests(unittest.TestCase):
             self.addCleanup(db.close)
             stack.enter_context(patch.object(db, "close"))
             stack.enter_context(patch.object(rag, "client", return_value=db))
-            stack.enter_context(patch.object(rag, "require_key"))
             stack.enter_context(patch.object(rag, "SEED_DIR", ROOT / "data/seed"))
             stack.enter_context(patch.object(rag, "OpenAIEmbeddings", return_value=OfflineEmbeddings()))
             original, original_ids = rag.seed_chunks()
@@ -341,11 +362,13 @@ class SeedSyncTests(unittest.TestCase):
                 self.edges = {"foreign-edge": {"id": "foreign-edge", "dataset": "other"}, "obsolete-edge": {"id": "obsolete-edge", "dataset": graph_seed.DATASET}}
 
             def run(self, query, **parameters):
-                if query.startswith("MERGE (n:"):
-                    self.nodes[parameters["id"]] = deepcopy(parameters["properties"])
+                if "MERGE (n:" in query:
+                    for row in parameters["rows"]:
+                        self.nodes[row["id"]] = deepcopy(row["properties"])
                 elif "MERGE (a)-[r:" in query:
-                    assert parameters["start"] in self.nodes and parameters["end"] in self.nodes
-                    self.edges[parameters["id"]] = deepcopy(parameters["properties"])
+                    for row in parameters["rows"]:
+                        assert row["start"] in self.nodes and row["end"] in self.nodes
+                        self.edges[row["id"]] = deepcopy(row["properties"])
                 else:
                     records = self.edges if "DELETE r" in query else self.nodes
                     obsolete = []
@@ -354,7 +377,10 @@ class SeedSyncTests(unittest.TestCase):
                             obsolete.append(key)
                     for key in obsolete:
                         del records[key]
-                return Mock()
+                result = Mock()
+                result.consume.return_value.counters.nodes_created = 0
+                result.consume.return_value.counters.relationships_created = 0
+                return result
 
         with patch.object(rag, "SEED_DIR", ROOT / "data/seed"):
             nodes, edges = graph_seed.seed_graph()
@@ -376,13 +402,13 @@ class SeedSyncTests(unittest.TestCase):
 class EvaluationModeTests(unittest.TestCase):
     def test_three_modes_are_disjoint_seed_only_and_include_consistent_corpus_metadata(self):
         with TestClient(main.app) as client, ExitStack() as stack:
-            stack.enter_context(patch.object(main, "questions", return_value=QUESTIONS))
-            stack.enter_context(patch.object(main, "corpus_status", return_value={"seed_ready": True}))
-            stack.enter_context(patch.object(main, "graph_status", return_value={"ready": True}))
-            stack.enter_context(patch.object(main, "seed_manifest", return_value={"documents": 34, "chunks": 158, "top_k": 4, "fingerprint": "offline"}))
+            stack.enter_context(patch.object(main, "load_questions", return_value=QUESTIONS))
+            stack.enter_context(patch.object(evaluation, "corpus_status", return_value={"seed_ready": True}))
+            stack.enter_context(patch.object(evaluation, "graph_status", return_value={"ready": True}))
+            stack.enter_context(patch.object(evaluation, "seed_manifest", return_value={"documents": 34, "chunks": 158, "top_k": 4, "fingerprint": "offline"}))
             handlers = {}
             for name in ("answer", "answer_multi_step", "graph_answer"):
-                handlers[name] = stack.enter_context(patch.object(main, name, return_value={"answer": "Offline answer fixture", "sources": [], "calls": {"llm": 1, "vector_searches": 0, "graph_queries": 0}, "status": "missing"}))
+                handlers[name] = stack.enter_context(patch.object(evaluation, name, return_value={"answer": "Offline answer fixture", "sources": [], "calls": {"llm": 1, "vector_searches": 0, "graph_queries": 0}, "status": "missing"}))
             for mode, handler in (("standard", "answer"), ("multi-step", "answer_multi_step"), ("graph", "graph_answer")):
                 for response in handlers.values():
                     response.reset_mock()
@@ -400,7 +426,7 @@ class EvaluationModeTests(unittest.TestCase):
                     self.assertEqual(invocation.kwargs, {"seed_only": True} if mode == "standard" else {})
 
     def test_evaluation_refuses_unsynchronized_seed_data_before_model_calls(self):
-        with TestClient(main.app) as client, patch.object(main, "questions", return_value=QUESTIONS), patch.object(main, "corpus_status", return_value={"seed_ready": False}), patch.object(main, "graph_status", return_value={"ready": False}), patch.object(main, "answer") as standard, patch.object(main, "answer_multi_step") as multi, patch.object(main, "graph_answer") as graphs:
+        with TestClient(main.app) as client, patch.object(main, "load_questions", return_value=QUESTIONS), patch.object(evaluation, "corpus_status", return_value={"seed_ready": False}), patch.object(evaluation, "graph_status", return_value={"ready": False}), patch.object(evaluation, "answer") as standard, patch.object(evaluation, "answer_multi_step") as multi, patch.object(evaluation, "graph_answer") as graphs:
             for mode in ("standard", "multi-step", "graph"):
                 self.assertEqual(client.post("/api/evaluate", json={"system": mode}).status_code, 409)
             standard.assert_not_called()
@@ -410,7 +436,7 @@ class EvaluationModeTests(unittest.TestCase):
     def test_changed_corpus_during_evaluation_is_not_exported_as_a_consistent_run(self):
         first = {"documents": 34, "chunks": 158, "top_k": 4, "fingerprint": "before"}
         second = dict(first, fingerprint="after")
-        with TestClient(main.app) as client, patch.object(main, "questions", return_value=QUESTIONS[:1]), patch.object(main, "corpus_status", return_value={"seed_ready": True}), patch.object(main, "seed_manifest", side_effect=[first, second]), patch.object(main, "answer", return_value={"answer": "Offline answer", "sources": []}):
+        with TestClient(main.app) as client, patch.object(main, "load_questions", return_value=QUESTIONS[:1]), patch.object(evaluation, "corpus_status", return_value={"seed_ready": True}), patch.object(evaluation, "seed_manifest", side_effect=[first, second]), patch.object(evaluation, "answer", return_value={"answer": "Offline answer", "sources": []}):
             response = client.post("/api/evaluate", json={"system": "standard"})
         self.assertEqual(response.status_code, 409)
         self.assertIn("changed during evaluation", response.json()["detail"])
@@ -427,7 +453,7 @@ class EvaluationModeTests(unittest.TestCase):
         retriever = Mock(ainvoke=AsyncMock(return_value=[document]))
         async def evaluate_in_worker():
             return await anyio.to_thread.run_sync(chat.answer_multi_step, "Who leads Atlas?", 4)
-        with patch.object(chat, "require_key"), patch.object(chat, "client", return_value=Mock()), patch.object(chat, "make_retriever", return_value=retriever) as make, patch.object(chat, "chat_model", return_value=model), patch.object(chat, "multi_step_documents", wraps=chat.multi_step_documents) as shared, patch.object(chat, "answer_chain", return_value=Mock(ainvoke=AsyncMock(return_value="Offline grounded answer"))):
+        with patch.object(chat, "client", return_value=Mock()), patch.object(chat, "make_retriever", return_value=retriever) as make, patch.object(chat, "chat_model", return_value=model), patch.object(chat, "multi_step_documents", wraps=chat.multi_step_documents) as shared, patch.object(chat, "answer_chain", return_value=Mock(ainvoke=AsyncMock(return_value="Offline grounded answer"))):
             result = anyio.run(evaluate_in_worker)
         shared.assert_awaited_once()
         self.assertEqual(make.call_args.args[1:], (4, True))

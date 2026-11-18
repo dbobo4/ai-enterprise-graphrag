@@ -1,12 +1,13 @@
-import importlib.util
 import json
-import sys
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 from fastapi.testclient import TestClient
 
+from app import evaluation, main
+from app.config import get_settings
 from app.evaluation import run_evaluation
 
 QUESTIONS_PATH = Path(__file__).resolve().parents[2] / "evaluation" / "questions.json"
@@ -102,26 +103,18 @@ class EvaluationTests(unittest.TestCase):
 
 
 class EvaluationApiTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        # Isolate the RAG boundary before importing the API: no model, embedding or database clients.
-        spec = importlib.util.spec_from_file_location("evaluation_api_test", Path(__file__).parents[1] / "app" / "main.py")
-        cls.api = importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules, {"app.rag": Mock(), "app.chat": Mock(), "app.uploads": Mock(UploadError=ValueError), spec.name: cls.api}):
-            spec.loader.exec_module(cls.api)
-
     def setUp(self):
-        self.client = TestClient(self.api.app)
+        self.client = TestClient(main.app)
         self.addCleanup(self.client.close)
-        readiness = patch.object(self.api, "corpus_status", return_value={"seed_ready": True})
+        readiness = patch.object(evaluation, "corpus_status", return_value={"seed_ready": True})
         readiness.start()
         self.addCleanup(readiness.stop)
-        manifest = patch.object(self.api, "seed_manifest", return_value={"documents": 34, "chunks": 158, "top_k": 4, "fingerprint": "offline"})
+        manifest = patch.object(evaluation, "seed_manifest", return_value={"documents": 34, "chunks": 158, "top_k": 4, "fingerprint": "offline"})
         manifest.start()
         self.addCleanup(manifest.stop)
 
     def test_post_returns_all_twelve_results_and_metrics(self):
-        with patch.object(self.api, "Path", return_value=QUESTIONS_PATH), patch.object(self.api, "answer", return_value=ANSWER) as answer:
+        with patch.object(main, "Path", return_value=QUESTIONS_PATH), patch.object(evaluation, "answer", return_value=ANSWER) as answer:
             response = self.client.post("/api/evaluate")
         self.assertEqual(response.status_code, 200)
         result = response.json()
@@ -144,7 +137,7 @@ class EvaluationApiTests(unittest.TestCase):
 
     def test_api_keeps_successes_when_one_question_fails(self):
         answers = [ANSWER, RuntimeError("private error details")] + [ANSWER] * 10
-        with patch.object(self.api, "Path", return_value=QUESTIONS_PATH), patch.object(self.api, "answer", side_effect=answers) as answer:
+        with patch.object(main, "Path", return_value=QUESTIONS_PATH), patch.object(evaluation, "answer", side_effect=answers) as answer:
             response = self.client.post("/api/evaluate")
         self.assertEqual(response.status_code, 200)
         result = response.json()
@@ -157,18 +150,39 @@ class EvaluationApiTests(unittest.TestCase):
         self.assertNotIn("private error details", response.text)
 
     def test_loading_questions_and_get_requests_do_not_run_evaluation(self):
-        with patch.object(self.api, "Path", return_value=QUESTIONS_PATH), patch.object(self.api, "answer") as answer:
+        with patch.object(main, "Path", return_value=QUESTIONS_PATH), patch.object(evaluation, "answer") as answer:
             self.assertEqual(self.client.get("/api/questions").json(), QUESTIONS)
             self.assertEqual(self.client.get("/api/health").status_code, 200)
             self.assertEqual(self.client.get("/api/evaluate").status_code, 405)
             answer.assert_not_called()
 
     def test_unavailable_question_file_returns_503_without_rag_calls(self):
-        with patch.object(self.api, "questions", side_effect=FileNotFoundError), patch.object(self.api, "answer") as answer:
+        with patch.object(main, "load_questions", side_effect=FileNotFoundError), patch.object(evaluation, "answer") as answer:
             response = self.client.post("/api/evaluate")
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json(), {"detail": "Test questions are unavailable."})
         answer.assert_not_called()
+
+    def test_request_dependency_can_supply_questions_and_mode(self):
+        with patch.dict(main.app.dependency_overrides, {main.evaluation_input: lambda: (QUESTIONS[:1], "standard")}), patch.object(evaluation, "answer", return_value=ANSWER):
+            response = self.client.post("/api/evaluate")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["results"][0]["id"], QUESTIONS[0]["id"])
+
+    def test_startup_validates_configuration_without_connecting(self):
+        self.addCleanup(get_settings.cache_clear)
+        for key, model, expected in (("", "text-embedding-3-small", "OPENAI_API_KEY"),
+                                      ("offline-test-key", "invalid-private-value", "OPENAI_EMBEDDING_MODEL")):
+            with self.subTest(expected=expected), patch.dict(os.environ, {"OPENAI_API_KEY": key, "OPENAI_EMBEDDING_MODEL": model}):
+                get_settings.cache_clear()
+                with self.assertRaisesRegex(RuntimeError, expected) as error:
+                    with TestClient(main.app):
+                        self.fail("Invalid configuration started the API")
+                self.assertNotIn("invalid-private-value", str(error.exception))
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "offline-test-key", "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small"}):
+            get_settings.cache_clear()
+            with TestClient(main.app) as api:
+                self.assertEqual(api.get("/api/health").status_code, 200)
 
 
 if __name__ == "__main__":

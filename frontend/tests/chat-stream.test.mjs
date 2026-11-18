@@ -23,6 +23,8 @@ test("search selection sends the correct backend mode and keeps streaming source
     assert.deepEqual(received[0], sources);
     assert.deepEqual(received.at(-1), done);
   }
+  await requestChat("What was approved?", "graph", "standard", new AbortController().signal, "minutes.md");
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { question: "What was approved?", top_k: 4, mode: "graph", filename: "minutes.md" });
 });
 
 function frames(events, newline = "\n") {
@@ -102,4 +104,7 @@ test("abort prevents additional buffered tokens from being displayed", async () 
 test("HTTP failures and malformed stream frames are rejected", async () => {
   await assert.rejects(readChatStream(new Response("Unavailable", { status: 503 }), () => {}, new AbortController().signal));
   await assert.rejects(readChatStream(response([new TextEncoder().encode("data: broken\n\n")]), () => {}, new AbortController().signal));
+  for (const invalid of [{ type: "token" }, { type: "unknown" }, { type: "sources", top_k: 4, sources: [null] }]) {
+    await assert.rejects(readChatStream(response([frames([invalid, done])]), () => {}, new AbortController().signal), /Invalid chat/);
+  }
 });

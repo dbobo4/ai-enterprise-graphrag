@@ -2,16 +2,19 @@ import asyncio
 import html
 import re
 import unicodedata
+from collections.abc import AsyncGenerator
 from contextlib import aclosing, closing
 from functools import partial
 
 from anyio import from_thread
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.vectorstores import VectorStoreRetriever
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from app.rag import answer_chain, chat_model, client, make_retriever, require_key, source_context
-from app.graph import retrieve_graph_async
+from app.contracts import Answer, Calls, ChatEvent, SearchMode, Source
+from app.rag import answer_chain, chat_model, client, make_retriever, source_context
+from app.graph import retrieve_graph_async, retrieve_upload
 
 MAX_STEPS = 3
 MISSING_EVIDENCE = "Nincs elegendő információ a korpuszban."
@@ -84,7 +87,7 @@ def supported_value(fact: GroundedFact, documents: list[Document]) -> str | None
     return None
 
 
-async def multi_step_documents(question: str, retriever, *, calls: dict | None = None) -> tuple[list[Document], bool]:
+async def multi_step_documents(question: str, retriever: VectorStoreRetriever, *, calls: Calls | None = None) -> tuple[list[Document], bool]:
     if calls is None:
         calls = {"llm": 0, "vector_searches": 0, "graph_queries": 0}
     prompt = ChatPromptTemplate.from_messages([
@@ -144,9 +147,8 @@ async def multi_step_documents(question: str, retriever, *, calls: dict | None =
     return documents, True
 
 
-async def multi_step_answer(question: str, k: int, *, seed_only: bool = False) -> dict:
-    require_key()
-    calls = {"llm": 0, "vector_searches": 0, "graph_queries": 0}
+async def multi_step_answer(question: str, k: int, *, seed_only: bool = False) -> Answer:
+    calls: Calls = {"llm": 0, "vector_searches": 0, "graph_queries": 0}
     with closing(client()) as db:
         retriever = await asyncio.to_thread(make_retriever, db, k, seed_only)
         documents, complete = await multi_step_documents(question, retriever, calls=calls)
@@ -160,12 +162,12 @@ async def multi_step_answer(question: str, k: int, *, seed_only: bool = False) -
             "note": None if complete else "A search step returned no evidence or its extracted answer could not be verified after one retry."}
 
 
-def answer_multi_step(question: str, k: int) -> dict:
+def answer_multi_step(question: str, k: int) -> Answer:
     # FastAPI runs Evaluation in an AnyIO worker; keep pooled HTTP clients on the application loop.
     return from_thread.run(partial(multi_step_answer, seed_only=True), question, k)
 
 
-async def stream_response(question: str, k: int, context: str, sources: list[dict], missing: str | None):
+async def stream_response(question: str, k: int, context: str, sources: list[Source], missing: str | None) -> AsyncGenerator[ChatEvent, None]:
     yield {"type": "sources", "sources": sources, "top_k": k}
     if missing:
         yield {"type": "token", "text": missing}
@@ -177,10 +179,12 @@ async def stream_response(question: str, k: int, context: str, sources: list[dic
     yield {"type": "done"}
 
 
-async def stream_answer(question: str, k: int, mode: str):
-    require_key()
+async def stream_answer(question: str, k: int, mode: SearchMode, *, filename: str | None = None) -> AsyncGenerator[ChatEvent, None]:
     if mode == "graph":
-        context, sources, missing = await retrieve_graph_async(question)
+        if filename:
+            context, sources, missing = await asyncio.to_thread(retrieve_upload, question, filename, k)
+        else:
+            context, sources, missing = await retrieve_graph_async(question)
         async with aclosing(stream_response(question, k, context, sources, missing)) as events:
             async for event in events:
                 yield event

@@ -1,21 +1,29 @@
 import json
-from contextlib import aclosing
-from datetime import datetime, timezone
-from functools import partial
+from collections.abc import AsyncGenerator
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.chat import answer_multi_step, stream_answer
-from app.evaluation import run_evaluation
-from app.graph import graph_answer, graph_status
-from app.rag import answer, corpus_status, index_seed, seed_manifest
-from app.uploads import MAX_UPLOAD_BYTES, UploadError, upload_document
+from app.chat import stream_answer
+from app.config import validate_startup
+from app.contracts import Answer, ErrorEvent, SearchMode
+from app.evaluation import EvaluationConflict, EvaluationRun, EvaluationUnavailable, Question, evaluate_corpus, load_questions
+from app.graph import graph_status
+from app.rag import answer, corpus_status, index_seed
+from app.uploads import MAX_UPLOAD_BYTES, UploadError, UploadResult, upload_document
 
-app = FastAPI(title="Enterprise GraphRAG API", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+    validate_startup()
+    yield
+
+
+app = FastAPI(title="Enterprise GraphRAG API", version="0.2.0", lifespan=lifespan)
 
 
 class ChatRequest(BaseModel):
@@ -24,7 +32,8 @@ class ChatRequest(BaseModel):
 
 
 class StreamChatRequest(ChatRequest):
-    mode: Literal["standard", "multi-step", "graph"] = "standard"
+    mode: SearchMode = "standard"
+    filename: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class EvaluationRequest(BaseModel):
@@ -53,44 +62,31 @@ def graph() -> dict:
 
 
 @app.get("/api/questions")
-def questions() -> list[dict]:
-    path = Path("/app/evaluation/questions.json")
-    return json.loads(path.read_text(encoding="utf-8"))
+def questions() -> list[Question]:
+    try:
+        return load_questions(Path("/app/evaluation/questions.json"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Test questions are unavailable.") from exc
+
+
+def evaluation_input(request: EvaluationRequest | None = None) -> tuple[list[Question], SearchMode]:
+    system = request.system if request else "standard"
+    return questions(), "standard" if system == "vector" else system
 
 
 @app.post("/api/evaluate")
-def evaluate(request: EvaluationRequest | None = None) -> dict:
+async def evaluate(inputs: Annotated[tuple[list[Question], SearchMode], Depends(evaluation_input)]) -> EvaluationRun:
+    test_questions, system = inputs
     try:
-        test_questions = questions()
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="Test questions are unavailable.") from exc
-    system = request.system if request else "standard"
-    manifest = seed_manifest()
-    if system == "vector":
-        system = "standard"
-    if system == "graph":
-        try:
-            ready = graph_status()["ready"]
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail="Graph search is unavailable.") from exc
-        respond = graph_answer
-    else:
-        try:
-            ready = corpus_status()["seed_ready"]
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail="Vector search is unavailable.") from exc
-        respond = answer_multi_step if system == "multi-step" else partial(answer, seed_only=True)
-    if not ready:
-        raise HTTPException(status_code=409, detail="Synchronize the built-in knowledge before evaluation.")
-    result = run_evaluation(test_questions, respond, system=system)
-    if seed_manifest() != manifest:
-        raise HTTPException(status_code=409, detail="Built-in documents changed during evaluation. Run it again after synchronization.")
-    result.update({"system": system, "corpus": manifest, "completed_at": datetime.now(timezone.utc).isoformat()})
-    return result
+        return await evaluate_corpus(test_questions, system)
+    except EvaluationUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except EvaluationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/ingest/upload")
-def ingest_upload(file: UploadFile = File(...)) -> dict:
+def ingest_upload(file: Annotated[UploadFile, File()]) -> UploadResult:
     try:
         content = file.file.read(MAX_UPLOAD_BYTES + 1)
         if len(content) > MAX_UPLOAD_BYTES:
@@ -101,7 +97,7 @@ def ingest_upload(file: UploadFile = File(...)) -> dict:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail="The document could not be added. Please try again.") from exc
+        raise HTTPException(status_code=502, detail="The document could not be added to both search systems. Retry the same file.") from exc
     finally:
         file.file.close()
 
@@ -116,8 +112,8 @@ def ingest_seed() -> dict:
         raise HTTPException(status_code=502, detail="Indexing failed. Check backend logs and configuration.") from exc
 
 
-@app.post("/api/chat")
-def chat(request: ChatRequest) -> dict:
+@app.post("/api/chat", response_model=None)
+def chat(request: ChatRequest) -> Answer:
     try:
         return answer(request.question, request.top_k)
     except ValueError as exc:
@@ -128,16 +124,19 @@ def chat(request: ChatRequest) -> dict:
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: StreamChatRequest, connection: Request) -> StreamingResponse:
-    async def events():
+    async def events() -> AsyncGenerator[str, None]:
         try:
             if await connection.is_disconnected():
                 return
-            async with aclosing(stream_answer(request.question, request.top_k, request.mode)) as stream:
+            stream = (stream_answer(request.question, request.top_k, request.mode, filename=request.filename)
+                      if request.mode == "graph" and request.filename else stream_answer(request.question, request.top_k, request.mode))
+            async with aclosing(stream):
                 async for event in stream:
                     if await connection.is_disconnected():
                         return
                     yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
         except Exception:
-            yield "data: " + json.dumps({"type": "error", "message": "The answer could not be completed. Please try again."}) + "\n\n"
+            error: ErrorEvent = {"type": "error", "message": "The answer could not be completed. Please try again."}
+            yield "data: " + json.dumps(error) + "\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})

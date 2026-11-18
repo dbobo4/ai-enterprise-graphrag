@@ -1,8 +1,17 @@
 # Enterprise GraphRAG
 
-An iteratively developed knowledge retrieval system, evolving from traditional RAG toward advanced GraphRAG.
+A knowledge assistant for company documents and uploads, with Vector RAG, Graph RAG and source citations.
 
-The goal is a simple, understandable, production-oriented architecture, developed and evaluated locally using synthetic enterprise data instead of large-scale infrastructure.
+## Architecture & Design
+
+- Keep HTTP validation in routes, workflows in services and database access at their edges so each can be tested separately.
+- Validate shared settings at API startup so configuration errors surface before requests.
+- Type streaming events, evaluation results and graph records so their fields are explicit at each boundary.
+- Reuse the same chunk content and stable IDs in both databases so repeated writes converge without duplicating records.
+- Keep normalized entity descriptions separate from exact source quotes so entity merges preserve every original reference.
+- Publish validated files atomically so parallel requests can reuse the same complete upload.
+- Write Neo4j records in labeled batches to reduce database round trips.
+- Share answer and source handling across retrieval modes while evaluating each mode on the same seed questions.
 
 ## Getting started
 
@@ -28,7 +37,9 @@ The goal is a simple, understandable, production-oriented architecture, develope
 
 For Vector RAG, index the built-in corpus in Chat if it has not been indexed yet. Graph loading does not call OpenAI or change Qdrant.
 
-After changing seed documents, use **Prepare documents** in Chat and rerun the graph sync command. Seed synchronization removes obsolete seed records and preserves uploaded documents.
+After changing seed documents, use **Prepare documents** in Chat and rerun the graph sync command. Keep seed files fixed while synchronizing. Seed synchronization removes obsolete seed records and preserves uploads.
+
+Uploads store the same chunks and document metadata in Qdrant and Neo4j. Retry the same file to complete a partial write. In Graph RAG, enter the saved filename to search uploaded text or leave it blank to search company facts. Business entities come from the reviewed seed.
 
 Neo4j settings are listed in [.env.example](.env.example). `NEO4J_PASSWORD` initializes the password on first start; an existing volume keeps its original password. `NEO4J_DATABASE` defaults to `neo4j`. Compose sets the backend connection to `bolt://neo4j:7687` with username `neo4j`; outside Docker, use `NEO4J_URI` and `NEO4J_USERNAME` for the local connection. Neo4j data persists in the `neo4j_data` volume.
 
@@ -46,19 +57,18 @@ Neo4j settings are listed in [.env.example](.env.example). `NEO4J_PASSWORD` init
 
 ### Results and observations
 
-- Both vector modes processed 12/12 questions; source coverage was 62.5% for Standard and 77.8% for Multi-step.
-- Average response time: Standard 3.04 s, Multi-step 10.23 s.
-- Standard's four excerpts cover 2.35% of the chunks. Global coverage was 37.5% vs. 41.7%; Multi-step can stop when intermediate evidence cannot be verified.
+- Both vector modes finished 12/12 questions. Standard reached 62.5% source coverage in 2.53 s on average, and Multi-step reached 76.4% in 7.25 s.
+- Global coverage was 37.5% for both. Multi-step stopped on some questions when intermediate evidence could not be verified.
 
 Detailed answers, sources and call counts are in [evaluation/baseline_answers.md](evaluation/baseline_answers.md). Use **Download evaluation report** to save an Evaluation run.
 
 ## Part 2 Graph & Schema
 
 - Neo4j integrated into Docker Compose
-- Document and chunk graph from the same 34 documents
-- Reviewed knowledge graph with 34 business entities and precise supporting chunks
-- Idempotent Python seed loading
-- 8 reproducible Cypher queries
+- Document and chunk graph for seed files and uploads with `CONTAINS` and `NEXT_CHUNK` links
+- Reviewed knowledge graph with 34 entities across companies, departments, people, projects, vendors, incidents and policies
+- Exact quotes on business edges and `SUPPORTED_BY` links from entities to source documents
+- Batched, idempotent Python seed loading and [8 Cypher queries](backend/graph.cypher)
 - LLM-guided Text2Cypher with validated, parameterized read templates
 - Vector RAG and Graph RAG selectable in the same streaming chat
 - Comparative evaluation: Vector Standard, Vector Multi-step and Graph RAG
@@ -66,8 +76,7 @@ Detailed answers, sources and call counts are in [evaluation/baseline_answers.md
 
 ### Results and observations
 
-- Graph RAG processed 12/12 questions, with 91.7% source coverage and a 6.46 s average response time.
-- Multi-hop and global source coverage reached 100%; latency fell between Standard and Multi-step.
-- Q04 is unsupported; Q12 omitted the 12-month retention rule for public training materials despite finding all expected documents.
+- Graph RAG finished 12/12 questions with 91.7% source coverage and a 5.53 s average response time.
+- Multi-hop and global source coverage reached 100%. Q04 was unsupported, and Q12 omitted the 12-month retention rule for public training materials despite finding all expected documents.
 
-Source coverage measures retrieved evidence, not answer correctness. Timings come from one local run per mode. Graph RAG uses reviewed relationships and selected evidence chunks, with no Vector fallback.
+Source coverage measures how many expected source documents were retrieved. Answer correctness requires a separate review.

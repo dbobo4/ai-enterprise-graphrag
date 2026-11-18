@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from contextlib import closing
 from uuid import NAMESPACE_URL, uuid5
@@ -8,28 +7,37 @@ from langchain_core.documents import Document
 from langchain_community.document_loaders import TextLoader
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.vectorstores import VectorStoreRetriever
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
+from qdrant_client.http.exceptions import UnexpectedResponse
+
+from app.config import get_settings
+from app.contracts import Answer, Calls, SeedManifest, Source
 
 SEED_DIR = Path("/app/data/seed")
 COLLECTION = "enterprise_seed_text_embedding_3_small_v1"
 
 
-def require_key() -> None:
-    if not os.getenv("OPENAI_API_KEY", "").strip():
-        raise ValueError("Set OPENAI_API_KEY in the project .env file, then restart the backend.")
-    if os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small") != "text-embedding-3-small":
-        raise ValueError("Stage 2 collection requires OPENAI_EMBEDDING_MODEL=text-embedding-3-small.")
-
-
 def client() -> QdrantClient:
-    return QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"), timeout=20)
+    return QdrantClient(url=get_settings().qdrant_url, timeout=20)
+
+
+def ensure_collection(db: QdrantClient) -> None:
+    if db.collection_exists(COLLECTION):
+        return
+    try:
+        db.create_collection(COLLECTION, vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE))
+    except UnexpectedResponse as exc:
+        if exc.status_code not in (400, 409) or not db.collection_exists(COLLECTION):
+            raise
 
 
 def store(db: QdrantClient) -> QdrantVectorStore:
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", max_retries=0)
+    settings = get_settings()
+    embeddings = OpenAIEmbeddings(model=settings.openai_embedding_model, api_key=settings.openai_api_key, max_retries=0)
     return QdrantVectorStore(client=db, collection_name=COLLECTION, embedding=embeddings)
 
 
@@ -55,16 +63,20 @@ def seed_chunks() -> tuple[list[Document], list[str]]:
     return documents, ids
 
 
-def seed_manifest() -> dict:
+def seed_manifest() -> SeedManifest:
     documents, ids = seed_chunks()
     return {"documents": len(list(SEED_DIR.rglob("*.md"))), "chunks": len(documents), "top_k": 4,
             "fingerprint": sha256("\n".join(ids).encode("utf-8")).hexdigest()}
 
 
 def indexed_seed_ids(db: QdrantClient) -> set[str]:
+    scope = models.Filter(must=[models.FieldCondition(key="metadata.kind", match=models.MatchValue(value="seed"))])
+    return indexed_ids(db, scope)
+
+
+def indexed_ids(db: QdrantClient, scope: models.Filter) -> set[str]:
     ids = set()
     cursor = None
-    scope = models.Filter(must=[models.FieldCondition(key="metadata.kind", match=models.MatchValue(value="seed"))])
     while True:
         points, cursor = db.scroll(collection_name=COLLECTION, scroll_filter=scope, with_payload=False,
                                    with_vectors=False, limit=100, offset=cursor)
@@ -75,14 +87,12 @@ def indexed_seed_ids(db: QdrantClient) -> set[str]:
 
 
 def index_seed() -> dict[str, int | bool]:
-    require_key()
     documents, ids = seed_chunks()
     if not documents:
         raise ValueError("No built-in documents were found.")
 
     with closing(client()) as db:
-        if not db.collection_exists(COLLECTION):
-            db.create_collection(COLLECTION, vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE))
+        ensure_collection(db)
 
         previous = indexed_seed_ids(db)
 
@@ -116,7 +126,7 @@ def corpus_status() -> dict[str, int | bool]:
             "ready": indexed > 0, "seed_ready": bool(ids) and seed_ids == set(ids)}
 
 
-def make_retriever(db: QdrantClient, k: int, seed_only: bool = False):
+def make_retriever(db: QdrantClient, k: int, seed_only: bool = False) -> VectorStoreRetriever:
     scope = None
     search = {"k": k}
     if seed_only:
@@ -127,9 +137,9 @@ def make_retriever(db: QdrantClient, k: int, seed_only: bool = False):
     return store(db).as_retriever(search_kwargs=search)
 
 
-def source_context(documents: list[Document]) -> tuple[str, list[dict]]:
+def source_context(documents: list[Document]) -> tuple[str, list[Source]]:
     context = ""
-    sources = []
+    sources: list[Source] = []
     for document in documents:
         source = document.metadata["source"]
         chunk = document.metadata["chunk"]
@@ -140,7 +150,8 @@ def source_context(documents: list[Document]) -> tuple[str, list[dict]]:
 
 
 def chat_model(max_tokens: int | None = None) -> ChatOpenAI:
-    return ChatOpenAI(model=os.getenv("OPENAI_CHAT_MODEL", "gpt-6-luna"), reasoning_effort="none", max_retries=0, max_tokens=max_tokens)
+    settings = get_settings()
+    return ChatOpenAI(model=settings.openai_chat_model, api_key=settings.openai_api_key, reasoning_effort="none", max_retries=0, max_tokens=max_tokens)
 
 
 def answer_chain():
@@ -155,11 +166,10 @@ def answer_chain():
     return prompt | chat_model() | StrOutputParser()
 
 
-def answer(question: str, k: int, *, seed_only: bool = False) -> dict:
-    require_key()
+def answer(question: str, k: int, *, seed_only: bool = False) -> Answer:
     with closing(client()) as db:
         documents = make_retriever(db, k, seed_only).invoke(question)
-        calls = {"llm": 0, "vector_searches": 1, "graph_queries": 0}
+        calls: Calls = {"llm": 0, "vector_searches": 1, "graph_queries": 0}
         if not documents:
             return {"answer": "Nincs elegendő információ a korpuszban.", "sources": [], "top_k": k, "status": "missing", "calls": calls}
         context, sources = source_context(documents)

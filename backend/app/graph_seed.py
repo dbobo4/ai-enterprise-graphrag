@@ -1,10 +1,15 @@
 """Reviewed HelioWorks facts. Sync: docker compose exec backend python -m app.graph_seed"""
 
+from typing import TypedDict
 from uuid import NAMESPACE_URL, uuid5
+
+from langchain_core.documents import Document
+from neo4j import ManagedTransaction, Session
 
 from app.rag import seed_chunks
 
 DATASET = "helioworks-seed-v1"
+UPLOAD_DATASET = "uploads"
 LABELS = {"Company", "Department", "Person", "Project", "Vendor", "Incident", "Policy"}
 RELATION_TYPES = {
     "HAS_DEPARTMENT": ("Company", "Department"), "WORKS_IN": ("Person", "Department"),
@@ -12,8 +17,32 @@ RELATION_TYPES = {
     "APPROVES": ("Department", "Policy"), "OWNS_CONTRACT": ("Department", "Vendor"),
 }
 
+EDGE_ENDPOINTS = dict.fromkeys(RELATION_TYPES, ("Entity", "Entity")) | {
+    "CONTAINS": ("Document", "Chunk"), "NEXT_CHUNK": ("Chunk", "Chunk"), "SUPPORTED_BY": ("Entity", "Document"),
+}
+
+
+class Evidence(TypedDict):
+    source_id: str
+    quote: str
+    chunk_id: str
+
+
+class Node(TypedDict):
+    id: str
+    label: str
+    properties: dict[str, str | int | list[str]]
+
+
+class Edge(TypedDict):
+    id: str
+    start: str
+    type: str
+    end: str
+    properties: dict[str, str | int | list[str]]
+
 # id, label, source, properties. Quotes identify actual supporting chunks, not whole documents.
-NODES = [
+NODES: list[tuple[str, str, str, dict[str, str | int]]] = [
     ("company:helioworks", "Company", "company.md", {"name": "HelioWorks Kft.", "quote": "HelioWorks Kft. has five departments: IT, HR, Procurement, Finance and Operations."}),
     ("department:it", "Department", "company.md", {"name": "IT", "quote": "HelioWorks Kft. has five departments: IT, HR, Procurement, Finance and Operations."}),
     ("department:hr", "Department", "company.md", {"name": "HR", "quote": "HelioWorks Kft. has five departments: IT, HR, Procurement, Finance and Operations."}),
@@ -48,144 +77,237 @@ NODES = [
     ("policy:access", "Policy", "policies/access.md", {"name": "Temporary accounts", "max_initial_days": 30, "renewal_notice_days": 5, "quote": "IT approves the Temporary accounts policy. Temporary third-party accounts have a maximum initial validity of 30 days. Renewal requests must arrive 5 days before expiry."}),
     ("policy:data", "Policy", "policies/data.md", {"name": "Data retention", "confidential_retention_months": 24, "training_retention_months": 12, "quote": "Finance approves the Data retention policy. Confidential project files are retained for 24 months after project closure. Public training materials are kept for 12 months after withdrawal."}),
     ("policy:vendors", "Policy", "policies/vendors.md", {"name": "Supplier management", "risk_review": "once per year", "performance_review": "quarterly", "quote": "Procurement approves the Supplier management policy. Supplier risk is reviewed once per year and service performance is reviewed quarterly."}),
+    ("person:nora-varga", "Person", "emails/atlas-window.md", {"name": "Nóra Varga", "role": "systems engineering lead", "quote": "From: Nóra Varga, IT."}),
 ]
 
-# start, relationship, end, source. Evidence comes from the stated business fact's quote.
-RELATIONSHIPS = [
-    ("company:helioworks", "HAS_DEPARTMENT", "department:it", "company.md"),
-    ("company:helioworks", "HAS_DEPARTMENT", "department:hr", "company.md"),
-    ("company:helioworks", "HAS_DEPARTMENT", "department:procurement", "company.md"),
-    ("company:helioworks", "HAS_DEPARTMENT", "department:finance", "company.md"),
-    ("company:helioworks", "HAS_DEPARTMENT", "department:operations", "company.md"),
-    ("person:nora-varga", "WORKS_IN", "department:it", "people/roles.md"),
-    ("person:tamas-fekete", "WORKS_IN", "department:hr", "people/roles.md"),
-    ("person:reka-kiss", "WORKS_IN", "department:procurement", "people/roles.md"),
-    ("person:bence-molnar", "WORKS_IN", "department:finance", "people/roles.md"),
-    ("person:nora-varadi", "WORKS_IN", "department:operations", "people/roles.md"),
-    ("person:peter-varga", "WORKS_IN", "department:finance", "people/roles.md"),
-    ("person:miklos-fekete", "WORKS_IN", "department:operations", "people/roles.md"),
-    ("person:nora-varga", "LEADS", "project:atlas", "projects/atlas.md"),
-    ("person:reka-kiss", "LEADS", "project:beacon", "projects/beacon.md"),
-    ("person:tamas-fekete", "LEADS", "project:bridge", "projects/bridge.md"),
-    ("person:nora-varadi", "LEADS", "project:atlas-archive", "projects/atlas-archive.md"),
-    ("person:peter-varga", "LEADS", "project:beacon-lab", "projects/beacon-lab.md"),
-    ("person:miklos-fekete", "LEADS", "project:bridge-north", "projects/bridge-north.md"),
-    ("vendor:novacloud", "SUPPLIES", "project:atlas", "vendors/novacloud.md"),
-    ("vendor:greenwire", "SUPPLIES", "project:beacon", "vendors/greenwire.md"),
-    ("vendor:greenwire", "SUPPLIES", "project:bridge-north", "vendors/greenwire.md"),
-    ("vendor:clearid", "SUPPLIES", "project:bridge", "vendors/clearid.md"),
-    ("vendor:dataloom", "SUPPLIES", "project:atlas-archive", "vendors/dataloom.md"),
-    ("vendor:safedesk", "SUPPLIES", "project:atlas", "vendors/safedesk.md"),
-    ("vendor:safedesk", "SUPPLIES", "project:beacon-lab", "vendors/safedesk.md"),
-    ("vendor:clearid-audit", "SUPPLIES", "project:bridge-north", "vendors/clearid-audit.md"),
-    ("incident:atlas", "AFFECTS", "project:atlas", "incidents/atlas.md"),
-    ("incident:beacon", "AFFECTS", "project:beacon", "incidents/beacon.md"),
-    ("incident:bridge", "AFFECTS", "project:bridge", "incidents/bridge.md"),
-    ("incident:atlas-archive", "AFFECTS", "project:atlas-archive", "incidents/atlas-archive.md"),
-    ("incident:bridge-north", "AFFECTS", "project:bridge-north", "incidents/bridge-north.md"),
-    ("incident:beacon-lab", "AFFECTS", "project:beacon-lab", "incidents/beacon-lab.md"),
-    ("department:it", "APPROVES", "policy:access", "policies/access.md"),
-    ("department:finance", "APPROVES", "policy:data", "policies/data.md"),
-    ("department:procurement", "APPROVES", "policy:vendors", "policies/vendors.md"),
-    ("department:procurement", "OWNS_CONTRACT", "vendor:novacloud", "vendors/novacloud.md"),
+# start, relationship, end, source, exact quote
+RELATIONSHIPS: list[tuple[str, str, str, str, str]] = [
+    ("company:helioworks", "HAS_DEPARTMENT", "department:it", "company.md", "HelioWorks Kft. has five departments: IT, HR, Procurement, Finance and Operations."),
+    ("company:helioworks", "HAS_DEPARTMENT", "department:hr", "company.md", "HelioWorks Kft. has five departments: IT, HR, Procurement, Finance and Operations."),
+    ("company:helioworks", "HAS_DEPARTMENT", "department:procurement", "company.md", "HelioWorks Kft. has five departments: IT, HR, Procurement, Finance and Operations."),
+    ("company:helioworks", "HAS_DEPARTMENT", "department:finance", "company.md", "HelioWorks Kft. has five departments: IT, HR, Procurement, Finance and Operations."),
+    ("company:helioworks", "HAS_DEPARTMENT", "department:operations", "company.md", "HelioWorks Kft. has five departments: IT, HR, Procurement, Finance and Operations."),
+    ("person:nora-varga", "WORKS_IN", "department:it", "people/roles.md", "Nóra Varga works in IT as a systems engineering lead."),
+    ("person:tamas-fekete", "WORKS_IN", "department:hr", "people/roles.md", "Tamás Fekete works in HR as an onboarding process owner."),
+    ("person:reka-kiss", "WORKS_IN", "department:procurement", "people/roles.md", "Réka Kiss works in Procurement as a supplier coordination lead."),
+    ("person:bence-molnar", "WORKS_IN", "department:finance", "people/roles.md", "Bence Molnár works in Finance as a cost reporting owner."),
+    ("person:nora-varadi", "WORKS_IN", "department:operations", "people/roles.md", "Nóra Váradi works in Operations as a records migration owner."),
+    ("person:peter-varga", "WORKS_IN", "department:finance", "people/roles.md", "Péter Varga works in Finance as a financial controls analyst."),
+    ("person:miklos-fekete", "WORKS_IN", "department:operations", "people/roles.md", "Miklós Fekete works in Operations as a warehouse process owner."),
+    ("person:nora-varga", "LEADS", "project:atlas", "projects/atlas.md", "Nóra Varga leads Project Atlas, the internal support ticketing platform, with a target go-live of 2026-11-15."),
+    ("person:reka-kiss", "LEADS", "project:beacon", "projects/beacon.md", "Réka Kiss leads Project Beacon, the office network renewal, with a target go-live of 2027-01-20."),
+    ("person:tamas-fekete", "LEADS", "project:bridge", "projects/bridge.md", "Tamás Fekete leads Project Bridge, the employee onboarding service, with a target go-live of 2026-12-01."),
+    ("person:nora-varadi", "LEADS", "project:atlas-archive", "projects/atlas-archive.md", "Nóra Váradi leads Project Atlas Archive, the records migration programme, with a target go-live of 2027-02-12."),
+    ("person:peter-varga", "LEADS", "project:beacon-lab", "projects/beacon-lab.md", "Péter Varga leads Project Beacon Lab, the finance network sandbox, with a target go-live of 2026-12-15."),
+    ("person:miklos-fekete", "LEADS", "project:bridge-north", "projects/bridge-north.md", "Miklós Fekete leads Project Bridge North, the warehouse onboarding programme, with a target go-live of 2027-01-11."),
+    ("vendor:novacloud", "SUPPLIES", "project:atlas", "vendors/novacloud.md", "NovaCloud Ltd. supplies managed API gateway hosting for Project Atlas."),
+    ("vendor:greenwire", "SUPPLIES", "project:beacon", "vendors/greenwire.md", "GreenWire Zrt. supplies network switches and equipment maintenance for Project Beacon and Project Bridge North."),
+    ("vendor:greenwire", "SUPPLIES", "project:bridge-north", "vendors/greenwire.md", "GreenWire Zrt. supplies network switches and equipment maintenance for Project Beacon and Project Bridge North."),
+    ("vendor:clearid", "SUPPLIES", "project:bridge", "vendors/clearid.md", "ClearID Kft. provides identity and document verification for Project Bridge."),
+    ("vendor:dataloom", "SUPPLIES", "project:atlas-archive", "vendors/dataloom.md", "DataLoom Zrt. supplies managed archive storage for Project Atlas Archive."),
+    ("vendor:safedesk", "SUPPLIES", "project:atlas", "vendors/safedesk.md", "SafeDesk Kft. supplies alert monitoring for Project Atlas and Project Beacon Lab."),
+    ("vendor:safedesk", "SUPPLIES", "project:beacon-lab", "vendors/safedesk.md", "SafeDesk Kft. supplies alert monitoring for Project Atlas and Project Beacon Lab."),
+    ("vendor:clearid-audit", "SUPPLIES", "project:bridge-north", "vendors/clearid-audit.md", "ClearID Audit Kft. supplies terminal access audits for Project Bridge North."),
+    ("incident:atlas", "AFFECTS", "project:atlas", "incidents/atlas.md", "On 2026-09-18, Project Atlas suffered an API outage lasting 42 minutes."),
+    ("incident:beacon", "AFFECTS", "project:beacon", "incidents/beacon.md", "On 2026-08-25, Project Beacon recorded intermittent office network disconnections."),
+    ("incident:bridge", "AFFECTS", "project:bridge", "incidents/bridge.md", "On 2026-10-09, Project Bridge experienced onboarding delays affecting 18 applications."),
+    ("incident:atlas-archive", "AFFECTS", "project:atlas-archive", "incidents/atlas-archive.md", "On 2026-10-27, Project Atlas Archive rejected a pilot document batch."),
+    ("incident:bridge-north", "AFFECTS", "project:bridge-north", "incidents/bridge-north.md", "On 2026-09-30, Project Bridge North could not print its training handover packs."),
+    ("incident:beacon-lab", "AFFECTS", "project:beacon-lab", "incidents/beacon-lab.md", "On 2026-10-16, Project Beacon Lab generated repeated sandbox alerts."),
+    ("department:it", "APPROVES", "policy:access", "policies/access.md", "IT approves the Temporary accounts policy."),
+    ("department:finance", "APPROVES", "policy:data", "policies/data.md", "Finance approves the Data retention policy."),
+    ("department:procurement", "APPROVES", "policy:vendors", "policies/vendors.md", "Procurement approves the Supplier management policy."),
+    ("department:procurement", "OWNS_CONTRACT", "vendor:novacloud", "vendors/novacloud.md", "NovaCloud Ltd. supplies managed API gateway hosting for Project Atlas. The agreement renews on 2027-03-01 and Procurement owns the contract."),
+    ("person:nora-varga", "WORKS_IN", "department:it", "emails/atlas-window.md", "From: Nóra Varga, IT."),
 ]
 
 
-def document_graph(documents: list, chunk_ids: list[str]) -> tuple[list[dict], list[dict]]:
+def edge_record(start: str, kind: str, end: str, dataset: str, source: str) -> Edge:
+    edge_id = str(uuid5(NAMESPACE_URL, f"{dataset}:{start}:{kind}:{end}"))
+    return {"id": edge_id, "start": start, "type": kind, "end": end,
+            "properties": {"id": edge_id, "dataset": dataset, "source_id": source}}
+
+
+def document_graph(documents: list[Document], chunk_ids: list[str], dataset: str = DATASET) -> tuple[list[Node], list[Edge]]:
     if len(documents) != len(chunk_ids):
         raise ValueError("Every chunk needs its original vector point id.")
-    nodes, edges, by_source = {}, [], {}
+    nodes: dict[str, Node] = {}
+    edges: list[Edge] = []
+    sequences: dict[str, list[tuple[int, str]]] = {}
     for document, chunk_id in zip(documents, chunk_ids):
         metadata = document.metadata
         source, index = metadata["source"], metadata["chunk"]
-        doc_id = "document:" + source
+        doc_id = "document:" + (f'upload:{metadata["document_id"]}' if dataset == UPLOAD_DATASET else source)
         if chunk_id in nodes or not isinstance(index, int) or index < 0 or not document.page_content.strip():
             raise ValueError("Invalid or duplicate chunk.")
-        nodes[doc_id] = {"id": doc_id, "label": "Document", "source_id": source, "source": source, "document_id": metadata["document_id"]}
-        row = {"id": chunk_id, "label": "Chunk", "source_id": source, "source": source, "chunk": index, "text": document.page_content}
-        for field in ("page", "section"):
-            if field in metadata:
+        common = {"dataset": dataset, "source_id": source, "source": source, "document_id": metadata["document_id"]}
+        if doc_id not in nodes:
+            properties = {**common, "id": doc_id}
+            for field in ("filename", "title", "total_pages", "author", "subject", "creator", "producer",
+                          "creationdate", "moddate", "keywords", "format", "trapped"):
+                if isinstance(metadata.get(field), (str, int)):
+                    properties[field] = metadata[field]
+            nodes[doc_id] = {"id": doc_id, "label": "Document", "properties": properties}
+        row = {**common, "id": chunk_id, "chunk": index, "text": document.page_content}
+        for field in ("page", "page_label", "section", "sheet"):
+            if isinstance(metadata.get(field), (str, int)):
                 row[field] = metadata[field]
-        nodes[chunk_id] = row
-        edges.append({"start": doc_id, "type": "CONTAINS", "end": chunk_id, "source_id": source})
-        by_source.setdefault(source, []).append((index, chunk_id))
-    for source, chunks in by_source.items():
+        nodes[chunk_id] = {"id": chunk_id, "label": "Chunk", "properties": row}
+        edges.append(edge_record(doc_id, "CONTAINS", chunk_id, dataset, source))
+        sequences.setdefault(source, []).append((index, chunk_id))
+    for source, chunks in sequences.items():
         chunks.sort()
         for position, (index, chunk_id) in enumerate(chunks):
             if index != position:
                 raise ValueError("Chunk numbers must start at zero and be consecutive.")
             if position > 0:
-                edges.append({"start": chunks[position - 1][1], "type": "NEXT_CHUNK", "end": chunk_id, "source_id": source})
+                edges.append(edge_record(chunks[position - 1][1], "NEXT_CHUNK", chunk_id, dataset, source))
     return list(nodes.values()), edges
 
 
-def seed_graph() -> tuple[list[dict], list[dict]]:
+def resolve_evidence(source: str, quote: str, chunks: dict[str, list[tuple[str, str]]]) -> list[Evidence]:
+    evidence: list[Evidence] = []
+    if quote.strip():
+        for text, chunk_id in chunks.get(source, []):
+            if quote in text:
+                evidence.append({"source_id": source, "quote": quote, "chunk_id": chunk_id})
+    if not evidence:
+        raise ValueError(f"No exact supporting chunk in {source}: {quote}")
+    return evidence
+
+
+def set_evidence(record: Node | Edge, evidence: list[Evidence]) -> None:
+    properties = record["properties"]
+    # Aligned lists store each original source/quote/chunk tuple in Neo4j properties.
+    properties["evidence_sources"] = [item["source_id"] for item in evidence]
+    properties["quotes"] = [item["quote"] for item in evidence]
+    properties["chunk_ids"] = [item["chunk_id"] for item in evidence]
+    properties["source_id"] = evidence[0]["source_id"]
+    properties["quote"] = evidence[0]["quote"]
+
+
+def seed_graph() -> tuple[list[Node], list[Edge]]:
     documents, chunk_ids = seed_chunks()
     nodes, edges = document_graph(documents, chunk_ids)
-    by_source = {}
+    chunks: dict[str, list[tuple[str, str]]] = {}
     for document, chunk_id in zip(documents, chunk_ids):
-        by_source.setdefault(document.metadata["source"], []).append((document.page_content, chunk_id))
-    entities = {}
-    for entity_id, label, source, properties in NODES:
-        if entity_id in entities or label not in LABELS or source not in by_source:
-            raise ValueError("Invalid seed entity or source.")
-        evidence = []
-        quote = " ".join(properties["quote"].split()).casefold()
-        for content, chunk_id in by_source[source]:
-            if quote in " ".join(content.split()).casefold():
-                evidence.append(chunk_id)
-        if not evidence:
-            raise ValueError(f"No supporting chunk for {entity_id}.")
-        node = {"id": entity_id, "label": label, "source_id": source, "chunk_ids": evidence, **properties}
-        entities[entity_id] = node
+        chunks.setdefault(document.metadata["source"], []).append((document.page_content, chunk_id))
+
+    entities: dict[str, Node] = {}
+    records: dict[str, Edge] = {}
+    proofs: dict[str, list[Evidence]] = {}
+    descriptions: dict[str, list[str]] = {}
+    for entity_id, label, source, declared in NODES:
+        if label not in LABELS:
+            raise ValueError(f"Unknown entity label: {label}.")
+        attributes = dict(declared)
+        quote = str(attributes.pop("quote"))
+        name = str(attributes["name"])
+        detail = attributes.get("purpose") or attributes.get("role") or attributes.get("service") or attributes.get("root_cause")
+        description = str(attributes.pop("description", f"{name}: {detail}" if detail else f"{name} ({label.lower()})"))
+        variants = descriptions.setdefault(entity_id, [])
+        if description not in variants:
+            variants.append(description)
+        node = entities.setdefault(entity_id, {"id": entity_id, "label": label, "properties": {"id": entity_id, "dataset": DATASET}})
+        if node["label"] != label:
+            raise ValueError(f"Conflicting labels for {entity_id}.")
+        properties = node["properties"]
+        for key, value in attributes.items():
+            if key in properties and properties[key] != value:
+                raise ValueError(f"Conflicting {key} for {entity_id}.")
+            properties[key] = value
+        evidence = resolve_evidence(source, quote, chunks)
+        support = edge_record(entity_id, "SUPPORTED_BY", "document:" + source, DATASET, source)
+        records[support["id"]] = support
+        for identity in (entity_id, support["id"]):
+            saved = proofs.setdefault(identity, [])
+            for item in evidence:
+                if item not in saved:
+                    saved.append(item)
+
+    for start, kind, end, source, quote in RELATIONSHIPS:
+        if kind not in RELATION_TYPES or start not in entities or end not in entities:
+            raise ValueError(f"Invalid business relationship: {start} {kind} {end}.")
+        if (entities[start]["label"], entities[end]["label"]) != RELATION_TYPES[kind]:
+            raise ValueError(f"Incompatible relationship endpoints: {start} {kind} {end}.")
+        edge = edge_record(start, kind, end, DATASET, source)
+        records[edge["id"]] = edge
+        saved = proofs.setdefault(edge["id"], [])
+        for item in resolve_evidence(source, quote, chunks):
+            if item not in saved:
+                saved.append(item)
+
+    for entity_id, node in entities.items():
+        node["properties"]["description"] = "; ".join(descriptions[entity_id])
+        set_evidence(node, proofs[entity_id])
         nodes.append(node)
-        edges.append({"start": entity_id, "type": "SUPPORTED_BY", "end": "document:" + source,
-                      "source_id": source, "quote": properties["quote"], "chunk_ids": evidence})
-    for start, kind, end, source in RELATIONSHIPS:
-        labels = (entities.get(start, {}).get("label"), entities.get(end, {}).get("label"))
-        if kind not in RELATION_TYPES or labels != RELATION_TYPES[kind]:
-            raise ValueError("Invalid seed relationship.")
-        owner = end if kind in ("LEADS", "APPROVES", "OWNS_CONTRACT") else start
-        evidence = entities[owner]
-        if evidence["source_id"] != source:
-            raise ValueError("Relationship evidence must belong to its stated source.")
-        edges.append({"start": start, "type": kind, "end": end, "source_id": source,
-                      "quote": evidence["quote"], "chunk_ids": evidence["chunk_ids"]})
-    for node in nodes:
-        node["dataset"] = DATASET
-    seen = set()
-    for edge in edges:
-        edge["id"] = str(uuid5(NAMESPACE_URL, f'{DATASET}:{edge["start"]}:{edge["type"]}:{edge["end"]}'))
-        edge["dataset"] = DATASET
-        if edge["id"] in seen:
-            raise ValueError("Duplicate seed relationship.")
-        seen.add(edge["id"])
+    for edge in records.values():
+        set_evidence(edge, proofs[edge["id"]])
+        edges.append(edge)
     return nodes, edges
 
 
-def write_seed(tx, nodes: list[dict], edges: list[dict]) -> None:
+def write_graph(tx: ManagedTransaction, nodes: list[Node], edges: list[Edge], dataset: str) -> int:
+    node_groups: dict[str, list[Node]] = {}
+    edge_groups: dict[str, list[Edge]] = {}
     for node in nodes:
-        label = node["label"]
-        if label not in LABELS | {"Document", "Chunk"}:
-            raise ValueError("Unknown node label.")
-        base = label if label in ("Document", "Chunk") else "Entity"
-        properties = dict(node)
-        del properties["label"]
-        tx.run(f"MERGE (n:{base} {{id: $id}}) SET n:{label} SET n = $properties", id=node["id"], properties=properties).consume()
+        if node["label"] not in LABELS | {"Document", "Chunk"} or node["properties"]["dataset"] != dataset:
+            raise ValueError("Invalid node label or dataset.")
+        node_groups.setdefault(node["label"], []).append(node)
     for edge in edges:
-        kind = edge["type"]
-        if kind not in set(RELATION_TYPES) | {"CONTAINS", "NEXT_CHUNK", "SUPPORTED_BY"}:
-            raise ValueError("Unknown relationship type.")
-        properties = dict(edge)
-        for field in ("start", "end", "type"):
-            del properties[field]
-        tx.run(f"MATCH (a {{id: $start, dataset: $dataset}}), (b {{id: $end, dataset: $dataset}}) "
-               f"MERGE (a)-[r:{kind} {{id: $id}}]->(b) SET r = $properties",
-               start=edge["start"], end=edge["end"], dataset=DATASET, id=edge["id"], properties=properties).consume()
+        if edge["type"] not in EDGE_ENDPOINTS or edge["properties"]["dataset"] != dataset:
+            raise ValueError("Invalid relationship type or dataset.")
+        edge_groups.setdefault(edge["type"], []).append(edge)
+
+    created = 0
+    # Write the Document first to serialize relationship MERGEs for concurrent uploads of that document.
+    for label in ("Document", "Chunk", *sorted(LABELS)):
+        if label not in node_groups:
+            continue
+        base = label if label in ("Document", "Chunk") else "Entity"
+        query = f"UNWIND $rows AS row MERGE (n:{base} {{id: row.id}}) SET n:{label} SET n = row.properties"
+        created += tx.run(query, rows=node_groups[label]).consume().counters.nodes_created
+    for kind, rows in edge_groups.items():
+        start, end = EDGE_ENDPOINTS[kind]
+        query = (
+            f"UNWIND $rows AS row MATCH (a:{start} {{id: row.start, dataset: $dataset}}), "
+            f"(b:{end} {{id: row.end, dataset: $dataset}}) "
+            f"MERGE (a)-[r:{kind} {{id: row.id}}]->(b) SET r = row.properties"
+        )
+        created += tx.run(query, rows=rows, dataset=dataset).consume().counters.relationships_created
+    return created
+
+
+def write_seed(tx: ManagedTransaction, nodes: list[Node], edges: list[Edge]) -> None:
+    write_graph(tx, nodes, edges, DATASET)
     node_ids = [node["id"] for node in nodes]
     edge_ids = [edge["id"] for edge in edges]
     tx.run("MATCH ()-[r]->() WHERE r.dataset = $dataset AND NOT r.id IN $ids DELETE r", dataset=DATASET, ids=edge_ids).consume()
     tx.run("MATCH (n) WHERE n.dataset = $dataset AND NOT n.id IN $ids DETACH DELETE n", dataset=DATASET, ids=node_ids).consume()
+
+
+def ensure_constraints(session: Session) -> None:
+    for label in ("Entity", "Document", "Chunk"):
+        session.run(f"CREATE CONSTRAINT {label.lower()}_id IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE").consume()
+
+
+def write_upload(tx: ManagedTransaction, nodes: list[Node], edges: list[Edge], ids: list[str]) -> bool:
+    created = write_graph(tx, nodes, edges, UPLOAD_DATASET)
+    obsolete = tx.run(
+        "MATCH (d:Document {id: $id, dataset: $dataset})-[:CONTAINS]->(c:Chunk {dataset: $dataset}) "
+        "WHERE NOT c.id IN $ids DETACH DELETE c",
+        id=nodes[0]["id"], dataset=UPLOAD_DATASET, ids=ids,
+    ).consume().counters.nodes_deleted
+    return bool(created or obsolete)
+
+
+def sync_upload(documents: list[Document], ids: list[str]) -> bool:
+    from app.graph import graph_driver, graph_session
+
+    nodes, edges = document_graph(documents, ids, UPLOAD_DATASET)
+    with graph_driver() as driver, graph_session(driver) as session:
+        ensure_constraints(session)
+        return session.execute_write(write_upload, nodes, edges, ids)
 
 
 def sync_seed() -> dict[str, int]:
@@ -193,8 +315,7 @@ def sync_seed() -> dict[str, int]:
 
     nodes, edges = seed_graph()
     with graph_driver() as driver, graph_session(driver) as session:
-        for label in ("Entity", "Document", "Chunk"):
-            session.run(f"CREATE CONSTRAINT {label.lower()}_id IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE").consume()
+        ensure_constraints(session)
         session.execute_write(write_seed, nodes, edges)
     counts = {"entities": 0, "documents": 0, "chunks": 0, "relationships": len(edges)}
     for node in nodes:

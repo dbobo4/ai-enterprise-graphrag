@@ -7,11 +7,33 @@ export type ChatEvent =
   | { type: "done" }
   | { type: "error"; message: string };
 
-export function requestChat(question: string, system: SearchSystem, mode: VectorMode, signal: AbortSignal) {
+export function requestChat(question: string, system: SearchSystem, mode: VectorMode, signal: AbortSignal, filename?: string) {
   return fetch("/api/chat/stream", {
     method: "POST", headers: { "Content-Type": "application/json" }, signal,
-    body: JSON.stringify({ question, top_k: 4, mode: system === "graph" ? "graph" : mode }),
+    body: JSON.stringify({ question, top_k: 4, mode: system === "graph" ? "graph" : mode, filename: system === "graph" ? filename : undefined }),
   });
+}
+
+function decodeEvent(data: string): ChatEvent {
+  const event: unknown = JSON.parse(data);
+  if (!event || typeof event !== "object" || !("type" in event)) throw new Error("Invalid chat event.");
+  if (event.type === "done") return { type: "done" };
+  if (event.type === "token" && "text" in event && typeof event.text === "string") return { type: "token", text: event.text };
+  if (event.type === "error" && "message" in event && typeof event.message === "string") return { type: "error", message: event.message };
+  if (event.type === "sources" && "sources" in event && Array.isArray(event.sources) &&
+      "top_k" in event && typeof event.top_k === "number" && Number.isInteger(event.top_k)) {
+    const sources: Source[] = [];
+    for (const item of event.sources as unknown[]) {
+      if (!item || typeof item !== "object" || !("source" in item) || typeof item.source !== "string" ||
+          !("chunk" in item) || typeof item.chunk !== "number" || !Number.isInteger(item.chunk) ||
+          !("reference" in item) || typeof item.reference !== "string" || !("snippet" in item) || typeof item.snippet !== "string") {
+        throw new Error("Invalid chat source.");
+      }
+      sources.push({ source: item.source, chunk: item.chunk, reference: item.reference, snippet: item.snippet });
+    }
+    return { type: "sources", sources, top_k: event.top_k };
+  }
+  throw new Error("Invalid chat event.");
 }
 
 export async function readChatStream(response: Response, onEvent: (event: ChatEvent) => void, signal: AbortSignal) {
@@ -39,7 +61,7 @@ export async function readChatStream(response: Response, onEvent: (event: ChatEv
           if (line.startsWith("data:")) data += line.slice(5).trimStart() + "\n";
         }
         if (data) {
-          const event: ChatEvent = JSON.parse(data);
+          const event = decodeEvent(data);
           onEvent(event);
           if (event.type === "error") throw new Error(event.message);
           if (event.type === "done") return;
